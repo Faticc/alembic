@@ -15,8 +15,15 @@ use steamworks::{
 
 pub const APP_ID: u32 = 480;
 /// Метка комнаты включает версию протокола: старые и новые сборки друг друга не видят.
-const LOBBY_TAG: &str = "alembic_tycoon_v4";
+const LOBBY_TAG: &str = "alembic_tycoon_v5";
 const TIMEOUT: f32 = 12.0;
+/// Как часто мерить пинг, секунды.
+const PING_EVERY: f32 = 1.0;
+
+/// Сглаживание пинга: новое значение входит на треть, чтобы цифра не прыгала.
+fn smooth_ping(old: Option<f32>, new: f32) -> f32 {
+    old.map_or(new, |o| o + (new - o) * 0.35)
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
@@ -104,6 +111,8 @@ pub struct Peer {
     pub name: String,
     pub p: Presence,
     silence: f32,
+    /// Пинг до этого игрока, мс (знает только хост).
+    pub ping_ms: Option<f32>,
 }
 
 pub struct LobbyInfo {
@@ -130,6 +139,9 @@ const T_STATE: u8 = 5;
 const T_CURSOR: u8 = 6;
 const T_CURSORS: u8 = 7;
 const T_BYE: u8 = 8;
+/// Замер пинга: отправитель кладёт своё время, получатель возвращает его как есть.
+const T_PING: u8 = 9;
+const T_PONG: u8 = 10;
 
 struct Wr(Vec<u8>);
 
@@ -271,6 +283,10 @@ pub struct Net {
     cursor: Presence,
     cursor_t: f32,
     state_t: f32,
+    clock: std::time::Instant,
+    ping_t: f32,
+    /// Клиенту: пинг до хоста, мс.
+    pub ping_ms: Option<f32>,
 }
 
 impl Net {
@@ -296,6 +312,9 @@ impl Net {
             cursor: Presence::default(),
             cursor_t: 0.0,
             state_t: 0.0,
+            clock: std::time::Instant::now(),
+            ping_t: 0.0,
+            ping_ms: None,
         }
     }
 
@@ -393,6 +412,7 @@ impl Net {
         self.host = None;
         self.peers.clear();
         self.synced = false;
+        self.ping_ms = None;
         self.status = "НЕ В СЕТИ".to_string();
     }
 
@@ -453,7 +473,20 @@ impl Net {
 
     /// Подставной игрок для скриншота-самопроверки (в сеть ничего не уходит).
     pub fn fake_peer(&mut self, id: u64, name: &str, p: Presence) {
-        self.peers.push(Peer { id: SteamId::from_raw(id), name: name.to_string(), p, silence: 0.0 });
+        self.peers.push(Peer { id: SteamId::from_raw(id), name: name.to_string(), p, silence: 0.0, ping_ms: None });
+    }
+
+    /// Пинг для счётчика: клиенту - до хоста, хосту - до самого медленного игрока.
+    pub fn ping(&self) -> Option<f32> {
+        match self.mode {
+            Mode::Client => self.ping_ms,
+            Mode::Host => self.peers.iter().filter_map(|p| p.ping_ms).reduce(f32::max),
+            Mode::Offline => None,
+        }
+    }
+
+    fn now_us(&self) -> u64 {
+        self.clock.elapsed().as_micros() as u64
     }
 
     pub fn set_presence(&mut self, p: Presence) {
@@ -466,6 +499,30 @@ impl Net {
             Some(t) => t,
             None => return,
         };
+        // Пинг одинаков у хоста и клиента: на T_PING отвечаем сразу, по T_PONG считаем задержку.
+        let known = match self.mode {
+            Mode::Host => self.peers.iter().any(|p| p.id == from),
+            Mode::Client => Some(from) == self.host,
+            Mode::Offline => false,
+        };
+        if known && (tag == T_PING || tag == T_PONG) {
+            if let Some(t) = r.u64() {
+                if tag == T_PING {
+                    self.send(from, &Wr::new(T_PONG).u64(t).0, false);
+                } else {
+                    let rtt = self.now_us().saturating_sub(t) as f32 / 1000.0;
+                    match self.mode {
+                        Mode::Host => {
+                            if let Some(p) = self.peers.iter_mut().find(|p| p.id == from) {
+                                p.ping_ms = Some(smooth_ping(p.ping_ms, rtt));
+                            }
+                        }
+                        _ => self.ping_ms = Some(smooth_ping(self.ping_ms, rtt)),
+                    }
+                }
+            }
+            return;
+        }
         match self.mode {
             Mode::Host => {
                 if tag == T_HELLO {
@@ -473,7 +530,7 @@ impl Net {
                     if let Some(p) = self.peers.iter_mut().find(|p| p.id == from) {
                         p.silence = 0.0;
                     } else if self.peers.len() < 7 {
-                        self.peers.push(Peer { id: from, name: name.clone(), p: Presence::default(), silence: 0.0 });
+                        self.peers.push(Peer { id: from, name: name.clone(), p: Presence::default(), silence: 0.0, ping_ms: None });
                         out.push(NetEvent::Info(format!("{} ПОДКЛЮЧИЛСЯ", name)));
                     } else {
                         return;
@@ -540,7 +597,7 @@ impl Net {
                         self.peers.clear();
                         while let (Some(id), Some(p), Some(name)) = (r.u64(), rd_pres(&mut r), r.str()) {
                             if id != self.my_id && self.peers.len() < 8 {
-                                self.peers.push(Peer { id: SteamId::from_raw(id), name, p, silence: 0.0 });
+                                self.peers.push(Peer { id: SteamId::from_raw(id), name, p, silence: 0.0, ping_ms: None });
                             }
                         }
                     }
@@ -637,6 +694,16 @@ impl Net {
 
         self.cursor_t -= dt;
         self.state_t -= dt;
+        self.ping_t -= dt;
+        if self.ping_t <= 0.0 {
+            self.ping_t = PING_EVERY;
+            let ping = Wr::new(T_PING).u64(self.now_us()).0;
+            match (self.mode, self.host) {
+                (Mode::Host, _) => self.broadcast(&ping, false),
+                (Mode::Client, Some(h)) if self.synced => self.send(h, &ping, false),
+                _ => {}
+            }
+        }
         match self.mode {
             Mode::Host => {
                 for p in &mut self.peers {
@@ -685,6 +752,28 @@ impl Net {
 mod tests {
     use super::*;
     use crate::world::World;
+
+    /// Хост по ответу на пинг считает задержку до игрока; чужие ответы не учитывает.
+    #[test]
+    fn ping_from_pong() {
+        let mut net = Net::new();
+        net.mode = Mode::Host;
+        net.fake_peer(5, "Drug", Presence::default());
+        assert_eq!(net.ping(), None);
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let pong = Wr::new(T_PONG).u64(0).0;
+        let mut out = Vec::new();
+        net.handle(SteamId::from_raw(99), &pong, &mut out);
+        assert_eq!(net.ping(), None);
+        net.handle(SteamId::from_raw(5), &pong, &mut out);
+        let p = net.ping().expect("пинг посчитан");
+        assert!(p >= 30.0 && p < 5000.0, "пинг {}", p);
+        assert!(out.is_empty());
+        // Сглаживание: резкий скачок входит не целиком.
+        assert!((smooth_ping(Some(100.0), 200.0) - 135.0).abs() < 0.01);
+        net.leave();
+        assert_eq!(net.ping(), None);
+    }
 
     #[test]
     fn codec_roundtrip() {

@@ -25,6 +25,43 @@ use world::{Dir, Kind, World};
 extern "system" {
     /// minifb не знает боковых кнопок мыши, поэтому спрашиваем Windows напрямую.
     fn GetAsyncKeyState(vk: i32) -> i16;
+    /// Размер основного монитора для полноэкранного режима.
+    fn GetSystemMetrics(index: i32) -> i32;
+}
+
+/// Настройки окна, которые помнятся между запусками (отдельно от сохранения мира).
+const SETTINGS_FILE: &str = "alembic_settings.txt";
+
+fn load_settings() -> (bool, bool) {
+    let text = std::fs::read_to_string(SETTINGS_FILE).unwrap_or_default();
+    let flag = |name: &str, def: bool| {
+        text.lines()
+            .filter_map(|l| l.strip_prefix(name)?.trim().parse::<u8>().ok())
+            .last()
+            .map_or(def, |v| v != 0)
+    };
+    (flag("fullscreen", false), flag("fps", true))
+}
+
+fn save_settings(fullscreen: bool, fps: bool) {
+    let _ = std::fs::write(SETTINGS_FILE, format!("fullscreen {}\nfps {}\n", fullscreen as u8, fps as u8));
+}
+
+/// Обычное окно с рамкой или окно без рамки во весь основной монитор.
+fn open_window(fullscreen: bool) -> Window {
+    let (w, h, opts) = if fullscreen {
+        // SM_CXSCREEN, SM_CYSCREEN
+        let (sw, sh) = unsafe { (GetSystemMetrics(0), GetSystemMetrics(1)) };
+        (sw.max(640) as usize, sh.max(360) as usize, WindowOptions { none: true, ..WindowOptions::default() })
+    } else {
+        (1280, 720, WindowOptions { resize: true, ..WindowOptions::default() })
+    };
+    let mut window = Window::new(TITLE, w, h, opts).expect("не удалось создать окно");
+    if fullscreen {
+        window.set_position(0, 0);
+    }
+    window.set_target_fps(60);
+    window
 }
 
 const TITLE: &str = "Alembic - алхимический тайкун";
@@ -178,12 +215,19 @@ fn main() {
             inp.my = 240;
         }
         game.show_net = has("--netmenu");
+        game.show_help = has("--helpscreen");
+        game.fps = 60.0;
+        game.frame_ms = 16.7;
         if has("--peers") {
             // Самопроверка отрисовки других игроков: один выделяет, второй вставляет, третий строит.
             let p = |x, y, tool, mode, rect| net::Presence { x, y, tool, dir: 1, mode, rect };
             game.net.fake_peer(1, "Fatic", p(37, 31, 255, 1, (33, 30, 37, 31)));
             game.net.fake_peer(2, "Drug", p(47, 33, 255, 2, (45, 32, 49, 34)));
             game.net.fake_peer(3, "Tretiy", p(42, 43, 2, 0, (0, 0, 0, 0)));
+            for (pl, ms) in game.net.peers.iter_mut().zip([34.0, 118.0, 260.0]) {
+                pl.ping_ms = Some(ms);
+            }
+            game.net.mode = net::Mode::Host;
         }
         if has("--ports") {
             // Самопроверка сторон: у смесителя выход вправо, у делителя закрыта левая сторона.
@@ -304,11 +348,19 @@ fn main() {
     game.persist = !smoke;
     let updater = if smoke || has("--no-update") { None } else { update::start() };
 
-    let (mut w, mut h) = (1280usize, 720usize);
-    let mut window = Window::new(TITLE, w, h, WindowOptions { resize: true, ..WindowOptions::default() })
-        .expect("не удалось создать окно");
-    window.set_target_fps(60);
+    let (mut fullscreen, show_fps) = load_settings();
+    if has("--fullscreen") {
+        fullscreen = true;
+    }
+    if has("--windowed") {
+        fullscreen = false;
+    }
+    game.show_fps = show_fps;
+    let mut window = open_window(fullscreen);
+    let (mut w, mut h) = window.get_size();
     let mut canvas = Image::new(w as i32, h as i32);
+    // Счётчик кадров: сколько кадров прошло за последние полсекунды.
+    let (mut fps_frames, mut fps_t) = (0u32, std::time::Instant::now());
     let mut last = std::time::Instant::now();
     let (mut pl, mut pr) = (false, false);
     let (mut px1, mut px2) = (false, false);
@@ -329,6 +381,14 @@ fn main() {
         let now = std::time::Instant::now();
         let dt = (now - last).as_secs_f32().min(0.1);
         last = now;
+        fps_frames += 1;
+        let span = (now - fps_t).as_secs_f32();
+        if span >= 0.5 {
+            game.fps = fps_frames as f32 / span;
+            game.frame_ms = span * 1000.0 / fps_frames as f32;
+            fps_frames = 0;
+            fps_t = now;
+        }
 
         let (mx, my) = window.get_mouse_pos(MouseMode::Pass).unwrap_or((-1.0, -1.0));
         let (mx, my) = (mx as i32, my as i32);
@@ -354,6 +414,7 @@ fn main() {
             x2_pressed: x2 && !px2,
             shift: down(Key::LeftShift, Key::RightShift),
             ctrl: down(Key::LeftCtrl, Key::RightCtrl),
+            alt: down(Key::LeftAlt, Key::RightAlt),
             wheel: window.get_scroll_wheel().map_or(0.0, |s| s.1),
             pressed: window.get_keys_pressed(KeyRepeat::No),
             pan_x: axis(down(Key::A, Key::Left), down(Key::D, Key::Right)),
@@ -377,6 +438,19 @@ fn main() {
         if window.update_with_buffer(&canvas.px, w, h).is_err() {
             break;
         }
+        if game.toggle_fullscreen {
+            // minifb не меняет стиль окна на ходу, поэтому окно пересоздаётся.
+            game.toggle_fullscreen = false;
+            fullscreen = !fullscreen;
+            drop(window);
+            window = open_window(fullscreen);
+            (pl, pr) = (true, true);
+            last = std::time::Instant::now();
+            if !smoke {
+                save_settings(fullscreen, game.show_fps);
+            }
+            continue;
+        }
         frames += 1;
         if smoke && frames > 90 {
             println!("smoke ok: {} frames", frames);
@@ -385,6 +459,9 @@ fn main() {
     }
     game.net.leave();
     game.save();
+    if !smoke {
+        save_settings(fullscreen, game.show_fps);
+    }
     // Скачанное обновление ставится при выходе; по F5 игра ещё и перезапускается.
     if game.update_ready.is_some() {
         drop(window);

@@ -10,3 +10,6 @@ alembic_save*.txt
 # Сгенерированное сохранение мегафабрики (см. src/megagen.rs)
 megafactory_save.txt
 /megarun
+
+# Настройки окна (полный экран, счётчик FPS)
+alembic_settings.txt

@@ -53,6 +53,7 @@ pub struct Input {
     pub x2_pressed: bool,
     pub shift: bool,
     pub ctrl: bool,
+    pub alt: bool,
     pub wheel: f32,
     pub pressed: Vec<Key>,
     pub pan_x: f32,

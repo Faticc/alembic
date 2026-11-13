@@ -62,6 +62,12 @@ pub struct Game {
     pub show_codex: bool,
     pub show_net: bool,
     pub show_path: bool,
+    /// Счётчик кадров в углу (F3); `fps` и `frame_ms` присылает главный цикл.
+    pub show_fps: bool,
+    pub fps: f32,
+    pub frame_ms: f32,
+    /// Просьба главному циклу переключить полноэкранный режим (F11, ALT+ENTER).
+    pub toggle_fullscreen: bool,
     /// Метка скачанного обновления и просьба перезапуститься (F5).
     pub update_ready: Option<String>,
     /// Где нажали ЛКМ без инструмента: если мышь не сдвинулась, это щелчок по стороне машины.
@@ -99,6 +105,16 @@ pub struct Game {
     my: i32,
 }
 
+fn ping_color(ms: f32) -> Color {
+    if ms < 80.0 {
+        GREEN
+    } else if ms < 200.0 {
+        GOLD
+    } else {
+        RED
+    }
+}
+
 fn inside(r: (i32, i32, i32, i32), x: i32, y: i32) -> bool {
     x >= r.0 && y >= r.1 && x < r.0 + r.2 && y < r.1 + r.3
 }
@@ -124,6 +140,10 @@ impl Game {
             show_codex: false,
             show_net: false,
             show_path: true,
+            show_fps: true,
+            fps: 0.0,
+            frame_ms: 0.0,
+            toggle_fullscreen: false,
             update_ready: None,
             click_at: None,
             restart: false,
@@ -740,6 +760,9 @@ impl Game {
                 Key::U => self.level_up_at(tx, ty),
                 Key::F => self.filter_reset_at(tx, ty),
                 Key::P => self.show_path = !self.show_path,
+                Key::F3 => self.show_fps = !self.show_fps,
+                Key::F11 => self.toggle_fullscreen = true,
+                Key::Enter if inp.alt => self.toggle_fullscreen = true,
                 Key::Tab => {
                     self.tab = (self.tab + 1) % TAB_NAMES.len();
                     self.audio.play(440.0, 0.04, 0.06, Wave::Tri, 0.0);
@@ -1341,6 +1364,10 @@ impl Game {
             c.text(hx, 15, help, 2, DIM);
         }
 
+        if self.show_fps {
+            self.draw_fps(c);
+        }
+
         if let Some(tag) = &self.update_ready {
             let s = format!("ОБНОВЛЕНИЕ {} ГОТОВО: F5 - ПЕРЕЗАПУСК (ИЛИ ВСТАНЕТ ПРИ ВЫХОДЕ)", tag);
             let tw = text_w(&s, 2);
@@ -1645,9 +1672,16 @@ impl Game {
                 let label = if self.net.mode == Mode::Host { "ЗАКРЫТЬ КОМНАТУ" } else { "ВЫЙТИ ИЗ КОМНАТЫ" };
                 button(c, self.net_button(0), label);
                 c.text(p.0 + 20, p.1 + 136, "ИГРОКИ:", 2, DIM);
-                c.text(p.0 + 20, p.1 + 166, &format!("{} (ТЫ)", self.net.my_name), 2, TEXT);
+                let x = c.text(p.0 + 20, p.1 + 166, &format!("{} (ТЫ)", self.net.my_name), 2, TEXT);
+                if let (Mode::Client, Some(ms)) = (self.net.mode, self.net.ping_ms) {
+                    c.text(x + 20, p.1 + 166, &format!("ПИНГ ДО ХОСТА {:.0} МС", ms), 2, ping_color(ms));
+                }
                 for (i, pl) in self.net.peers.iter().enumerate() {
-                    c.text(p.0 + 20, p.1 + 194 + i as i32 * 28, &pl.name, 2, TEXT);
+                    let y = p.1 + 194 + i as i32 * 28;
+                    let x = c.text(p.0 + 20, y, &pl.name, 2, TEXT);
+                    if let Some(ms) = pl.ping_ms {
+                        c.text(x + 20, y, &format!("{:.0} МС", ms), 2, ping_color(ms));
+                    }
                 }
             }
         }
@@ -1661,6 +1695,31 @@ impl Game {
         }
     }
 
+    /// Счётчик кадров в левом нижнем углу: зелёный от 55 FPS, жёлтый от 30, ниже - красный.
+    /// В сетевой игре рядом пинг: зелёный до 80 мс, жёлтый до 200, дальше красный.
+    fn draw_fps(&self, c: &mut Image) {
+        let s = format!("{:.0} FPS  {:.1} МС", self.fps, self.frame_ms);
+        let col = if self.fps >= 55.0 {
+            GREEN
+        } else if self.fps >= 30.0 {
+            GOLD
+        } else {
+            RED
+        };
+        let ping = self.net.online().then(|| match self.net.ping() {
+            Some(ms) => (format!("ПИНГ {:.0} МС", ms), ping_color(ms)),
+            None => ("ПИНГ ...".to_string(), DIM),
+        });
+        // Пинг - строкой выше, чтобы плашка не залезала под панель построек.
+        let rows = 1 + ping.is_some() as i32;
+        let tw = text_w(&s, 2).max(ping.as_ref().map_or(0, |p| text_w(&p.0, 2)));
+        c.fill_rect(8, c.h - 8 - 28 * rows, tw + 16, 28 * rows, 0xE02B_2433);
+        c.text(16, c.h - 29, &s, 2, col);
+        if let Some((p, pc)) = ping {
+            c.text(16, c.h - 57, &p, 2, pc);
+        }
+    }
+
     fn draw_help(&self, c: &mut Image) {
         let lines = [
             "ALEMBIC - АЛХИМИЧЕСКИЙ ТАЙКУН",
@@ -1671,7 +1730,7 @@ impl Game {
             "ВЫПОЛНЯЙ КОНТРАКТЫ, ЧТОБЫ ОТКРЫВАТЬ НОВЫЕ МАШИНЫ.",
             "",
             "TAB            СЛЕДУЮЩАЯ ВКЛАДКА ПОСТРОЕК",
-            "1-9            ВЫБОР ПОСТРОЙКИ НА ВКЛАДКЕ",
+            "1-9, 0         ВЫБОР ПОСТРОЙКИ НА ВКЛАДКЕ",
             "МЫШЬ 4 / 5     ПРЕДЫДУЩАЯ / СЛЕДУЮЩАЯ ПОСТРОЙКА",
             "ЛКМ            СТРОИТЬ (КОНВЕЙЕР - ТЯНУТЬ МЫШЬЮ)",
             "ПКМ            СНЕСТИ (ДЕНЬГИ ВОЗВРАЩАЮТСЯ)",
@@ -1686,6 +1745,7 @@ impl Game {
             "P              ПОКАЗАТЬ / СКРЫТЬ ПУТЬ КОНТРАКТА",
             "C              КАТАЛОГ ВСЕХ ПРЕДМЕТОВ И РЕЦЕПТОВ",
             "F2             СЕТЕВАЯ ИГРА ЧЕРЕЗ STEAM",
+            "F3 / F11       СЧЁТЧИК FPS / ПОЛНЫЙ ЭКРАН",
             "WASD / ЛКМ     ДВИГАТЬ КАМЕРУ",
             "КОЛЕСО         МАСШТАБ",
             "M              ЗВУК ВКЛ/ВЫКЛ",
@@ -1700,11 +1760,13 @@ impl Game {
         ];
         c.fill_rect(0, 0, c.w, c.h, 0xA010_0E16);
         let bw = 700.min(c.w - 20);
-        let bh = lines.len() as i32 * 22 + 40;
+        // Шаг строк ужимается, чтобы справка целиком влезала в невысокое окно.
+        let lh = ((c.h - 60) / lines.len() as i32).clamp(16, 22);
+        let bh = lines.len() as i32 * lh + 40;
         let (bx, by) = ((c.w - bw) / 2, (c.h - bh) / 2);
         panel(c, (bx, by, bw, bh), GOLD);
         for (i, l) in lines.iter().enumerate() {
-            let y = by + 22 + i as i32 * 22;
+            let y = by + 22 + i as i32 * lh;
             if i == 0 || i == lines.len() - 1 {
                 c.text_center(c.w / 2, y, l, 2, GOLD);
             } else {
