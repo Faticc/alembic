@@ -1,0 +1,16 @@
+[package]
+name = "alembic-setup"
+version = "0.1.0"
+edition = "2021"
+description = "Установщик Alembic одним файлом: игра и steam_api64.dll вшиты внутрь"
+
+[[bin]]
+name = "AlembicSetup"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+
+[workspace]

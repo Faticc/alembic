@@ -1,0 +1,17 @@
+[package]
+name = "alembic"
+version = "0.2.0"
+edition = "2021"
+description = "Alembic - алхимический фабричный тайкун на собственном мини-движке"
+
+[dependencies]
+minifb = "0.27"
+steamworks = "0.13.1"
+tinyaudio = "1"
+
+[profile.dev]
+opt-level = 2
+
+[profile.release]
+opt-level = 3
+lto = true

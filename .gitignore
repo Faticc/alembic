@@ -1,0 +1,8 @@
+# Сборки
+/target
+/installer/target
+/dist
+
+# Сохранения и скриншоты самопроверки
+alembic_save*.txt
+/shots
