@@ -167,6 +167,13 @@ fn main() {
             inp.my = 240;
         }
         game.show_net = has("--netmenu");
+        if has("--peers") {
+            // Самопроверка отрисовки других игроков: один выделяет, второй вставляет, третий строит.
+            let p = |x, y, tool, mode, rect| net::Presence { x, y, tool, dir: 1, mode, rect };
+            game.net.fake_peer(1, "Fatic", p(37, 31, 255, 1, (33, 30, 37, 31)));
+            game.net.fake_peer(2, "Drug", p(47, 33, 255, 2, (45, 32, 49, 34)));
+            game.net.fake_peer(3, "Tretiy", p(42, 43, 2, 0, (0, 0, 0, 0)));
+        }
         if has("--ports") {
             // Самопроверка сторон: у смесителя выход вправо, у делителя закрыта левая сторона.
             use world::{pack_ports, PORT_AUTO, PORT_IN, PORT_OFF, PORT_OUT};

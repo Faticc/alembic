@@ -4,7 +4,7 @@ use crate::assets::*;
 use crate::engine::audio::{Audio, Wave};
 use crate::engine::font::text_w;
 use crate::engine::*;
-use crate::net::{Cmd, Mode, Net, NetEvent, Op, StateMsg};
+use crate::net::{Cmd, Mode, Net, NetEvent, Op, Presence, StateMsg};
 use crate::world::*;
 
 const TOP_H: i32 = 44;
@@ -562,7 +562,23 @@ impl Game {
 
     /// Сетевые события: хост раздаёт мир и исполняет команды, клиент повторяет за хостом.
     fn net_update(&mut self, dt: f32, tx: i32, ty: i32) {
-        self.net.set_cursor(tx, ty);
+        // Остальные игроки видят курсор, выбранную постройку, рамку выделения и вставку.
+        let (mode, rect) = if self.pasting {
+            let (w, h) = self.clip_size;
+            (2, (tx - w / 2, ty - h / 2, tx - w / 2 + w - 1, ty - h / 2 + h - 1))
+        } else if let Some(r) = self.sel {
+            (1, r)
+        } else {
+            (0, (0, 0, 0, 0))
+        };
+        self.net.set_presence(Presence {
+            x: tx,
+            y: ty,
+            tool: self.tool.map_or(255, |k| k.0),
+            dir: self.dir as u8,
+            mode,
+            rect,
+        });
         for ev in self.net.poll(dt) {
             match ev {
                 NetEvent::Hello(id, _) => self.net.send_world(id, &self.world.save()),
@@ -1254,12 +1270,27 @@ impl Game {
             c.rect_outline(ox + bx * ts, oy + by * ts, cw * ts, ch * ts, z.max(2), GOLD);
         }
 
-        // Курсоры других игроков.
+        // Другие игроки: курсор, постройка в руках, рамка выделения или вставки.
         for p in &self.net.peers {
             let col = [hex(0x58B4F0), hex(0xF07AD8), hex(0x7ED67A), hex(0xFFB03A)][(p.id.raw() % 4) as usize];
-            let (sx, sy) = (ox + p.cx * ts, oy + p.cy * ts);
+            let pr = &p.p;
+            let (sx, sy) = (ox + pr.x * ts, oy + pr.y * ts);
+            let mut label_y = sy;
+            let mut label = p.name.clone();
+            if pr.mode > 0 {
+                let (rx0, ry0) = (pr.rect.0.clamp(-1, W), pr.rect.1.clamp(-1, H));
+                let (rx1, ry1) = (pr.rect.2.clamp(rx0, W), pr.rect.3.clamp(ry0, H));
+                let (px, py) = (ox + rx0 * ts, oy + ry0 * ts);
+                let (pw, ph) = ((rx1 - rx0 + 1) * ts, (ry1 - ry0 + 1) * ts);
+                c.fill_rect(px, py, pw, ph, with_alpha(col, if pr.mode == 1 { 0x38 } else { 0x20 }));
+                c.rect_outline(px, py, pw, ph, z.max(2), col);
+                label_y = py;
+                label.push_str(if pr.mode == 1 { ": ВЫДЕЛЯЕТ" } else { ": ВСТАВЛЯЕТ" });
+            } else if let Some(kind) = Kind::from_u8(pr.tool) {
+                c.blit_ex(self.sprite(kind, 0), sx, sy, z, pr.dir, 140);
+            }
             c.rect_outline(sx, sy, ts, ts, z.max(2), col);
-            c.text_center(sx + ts / 2, sy - 18, &p.name, 2, col);
+            c.text_center(ox + pr.x * ts + ts / 2, label_y.min(sy) - 18, &label, 2, col);
         }
 
         // Всплывающие суммы.

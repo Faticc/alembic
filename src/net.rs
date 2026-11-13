@@ -15,7 +15,7 @@ use steamworks::{
 
 pub const APP_ID: u32 = 480;
 /// Метка комнаты включает версию протокола: старые и новые сборки друг друга не видят.
-const LOBBY_TAG: &str = "alembic_tycoon_v3";
+const LOBBY_TAG: &str = "alembic_tycoon_v4";
 const TIMEOUT: f32 = 12.0;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -69,11 +69,40 @@ pub enum NetEvent {
     Lost(String),
 }
 
+/// Что игрок делает прямо сейчас - это видят остальные.
+#[derive(Clone, Copy, Default, PartialEq, Debug)]
+pub struct Presence {
+    /// Тайл под курсором.
+    pub x: i32,
+    pub y: i32,
+    /// Выбранная постройка (Kind.0) или 255, если руки пусты.
+    pub tool: u8,
+    pub dir: u8,
+    /// 0 - ничего, 1 - рамка выделения, 2 - вставка из буфера.
+    pub mode: u8,
+    /// Рамка в тайлах: (x0, y0, x1, y1), включительно.
+    pub rect: (i32, i32, i32, i32),
+}
+
+fn wr_pres(w: Wr, p: &Presence) -> Wr {
+    w.i16(p.x).i16(p.y).u8(p.tool).u8(p.dir).u8(p.mode).i16(p.rect.0).i16(p.rect.1).i16(p.rect.2).i16(p.rect.3)
+}
+
+fn rd_pres(r: &mut Rd) -> Option<Presence> {
+    Some(Presence {
+        x: r.i16()?,
+        y: r.i16()?,
+        tool: r.u8()?,
+        dir: r.u8()? & 3,
+        mode: r.u8()?,
+        rect: (r.i16()?, r.i16()?, r.i16()?, r.i16()?),
+    })
+}
+
 pub struct Peer {
     pub id: SteamId,
     pub name: String,
-    pub cx: i32,
-    pub cy: i32,
+    pub p: Presence,
     silence: f32,
 }
 
@@ -239,7 +268,7 @@ pub struct Net {
     synced: bool,
     hello_t: f32,
     host_silence: f32,
-    cursor: (i32, i32),
+    cursor: Presence,
     cursor_t: f32,
     state_t: f32,
 }
@@ -264,7 +293,7 @@ impl Net {
             synced: false,
             hello_t: 0.0,
             host_silence: 0.0,
-            cursor: (0, 0),
+            cursor: Presence::default(),
             cursor_t: 0.0,
             state_t: 0.0,
         }
@@ -422,8 +451,13 @@ impl Net {
         self.broadcast(&w.0, true);
     }
 
-    pub fn set_cursor(&mut self, x: i32, y: i32) {
-        self.cursor = (x, y);
+    /// Подставной игрок для скриншота-самопроверки (в сеть ничего не уходит).
+    pub fn fake_peer(&mut self, id: u64, name: &str, p: Presence) {
+        self.peers.push(Peer { id: SteamId::from_raw(id), name: name.to_string(), p, silence: 0.0 });
+    }
+
+    pub fn set_presence(&mut self, p: Presence) {
+        self.cursor = p;
     }
 
     fn handle(&mut self, from: SteamId, data: &[u8], out: &mut Vec<NetEvent>) {
@@ -439,7 +473,7 @@ impl Net {
                     if let Some(p) = self.peers.iter_mut().find(|p| p.id == from) {
                         p.silence = 0.0;
                     } else if self.peers.len() < 7 {
-                        self.peers.push(Peer { id: from, name: name.clone(), cx: 0, cy: 0, silence: 0.0 });
+                        self.peers.push(Peer { id: from, name: name.clone(), p: Presence::default(), silence: 0.0 });
                         out.push(NetEvent::Info(format!("{} ПОДКЛЮЧИЛСЯ", name)));
                     } else {
                         return;
@@ -459,9 +493,8 @@ impl Net {
                         }
                     }
                     T_CURSOR => {
-                        if let (Some(x), Some(y)) = (r.i16(), r.i16()) {
-                            self.peers[idx].cx = x;
-                            self.peers[idx].cy = y;
+                        if let Some(p) = rd_pres(&mut r) {
+                            self.peers[idx].p = p;
                         }
                     }
                     T_BYE => {
@@ -505,9 +538,9 @@ impl Net {
                     }
                     T_CURSORS => {
                         self.peers.clear();
-                        while let (Some(id), Some(x), Some(y), Some(name)) = (r.u64(), r.i16(), r.i16(), r.str()) {
+                        while let (Some(id), Some(p), Some(name)) = (r.u64(), rd_pres(&mut r), r.str()) {
                             if id != self.my_id && self.peers.len() < 8 {
-                                self.peers.push(Peer { id: SteamId::from_raw(id), name, cx: x, cy: y, silence: 0.0 });
+                                self.peers.push(Peer { id: SteamId::from_raw(id), name, p, silence: 0.0 });
                             }
                         }
                     }
@@ -616,9 +649,9 @@ impl Net {
                 }
                 if self.cursor_t <= 0.0 && !self.peers.is_empty() {
                     self.cursor_t = 0.15;
-                    let mut w = Wr::new(T_CURSORS).u64(self.my_id).i16(self.cursor.0).i16(self.cursor.1).str(&self.my_name);
+                    let mut w = wr_pres(Wr::new(T_CURSORS).u64(self.my_id), &self.cursor).str(&self.my_name);
                     for p in &self.peers {
-                        w = w.u64(p.id.raw()).i16(p.cx).i16(p.cy).str(&p.name);
+                        w = wr_pres(w.u64(p.id.raw()), &p.p).str(&p.name);
                     }
                     self.broadcast(&w.0, false);
                 }
@@ -634,7 +667,7 @@ impl Net {
                         }
                     } else if self.cursor_t <= 0.0 {
                         self.cursor_t = 0.15;
-                        self.send(h, &Wr::new(T_CURSOR).i16(self.cursor.0).i16(self.cursor.1).0, false);
+                        self.send(h, &wr_pres(Wr::new(T_CURSOR), &self.cursor).0, false);
                     }
                 }
                 if self.host_silence > TIMEOUT {
@@ -786,6 +819,18 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn presence_roundtrip() {
+        let p = Presence { x: 79, y: -3, tool: 17, dir: 2, mode: 2, rect: (4, 5, 40, 41) };
+        let bytes = wr_pres(Wr::new(T_CURSOR), &p).0;
+        assert_eq!(rd_pres(&mut Rd(&bytes[1..])), Some(p));
+        assert!(rd_pres(&mut Rd(&bytes[1..bytes.len() - 1])).is_none(), "обрезанное сообщение отброшено");
+        // В рассылке хоста записи идут подряд: идентификатор, состояние, имя.
+        let list = wr_pres(Wr::new(T_CURSORS).u64(42), &p).str("Друг").0;
+        let mut r = Rd(&list[1..]);
+        assert_eq!((r.u64(), rd_pres(&mut r), r.str()), (Some(42), Some(p), Some("Друг".to_string())));
     }
 
     fn belt_len(w: &World, x: i32, y: i32) -> usize {
