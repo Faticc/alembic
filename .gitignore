@@ -6,3 +6,7 @@
 # Сохранения и скриншоты самопроверки
 alembic_save*.txt
 /shots
+
+# Сгенерированное сохранение мегафабрики (см. src/megagen.rs)
+megafactory_save.txt
+/megarun

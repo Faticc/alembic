@@ -725,6 +725,7 @@ impl Game {
                 Key::Key7 => 6,
                 Key::Key8 => 7,
                 Key::Key9 => 8,
+                Key::Key0 => 9,
                 _ => usize::MAX,
             };
             let list = Kind::in_tab(self.tab);
@@ -1123,7 +1124,12 @@ impl Game {
                             c.blit_ex(&a.belt_cap, sx, sy, z, rot + 2, 255);
                         }
                     }
-                    Role::Bridge => c.blit(self.sprite(b.kind, 0), sx, sy, z),
+                    // Настил моста лежит вдоль направления постройки.
+                    Role::Bridge => c.blit_ex(self.sprite(b.kind, 0), sx, sy, z, b.dir as u8, 255),
+                    Role::Tunnel => {
+                        let exit = w.tunnel_is_exit(x, y);
+                        c.blit_ex(self.sprite(b.kind, exit as usize), sx, sy, z, b.dir as u8, 255);
+                    }
                     _ => {}
                 }
             }
@@ -1136,9 +1142,16 @@ impl Game {
                     Some(b) if b.kind.is_track() => b,
                     _ => continue,
                 };
+                // У пары подземных конвейеров видна только открытая половина клетки.
+                let tunnel = b.kind.role() == Role::Tunnel;
+                let exit = tunnel && w.tunnel_is_exit(x, y);
+                let paired = exit || (tunnel && w.tunnel_exit(x, y).is_some());
                 for lane in &b.lanes {
                     for bi in lane {
-                        let out = if b.kind.is_belt() { b.dir } else { bi.d };
+                        if paired && (bi.p < 0.5) == exit {
+                            continue;
+                        }
+                        let out = if b.kind.is_belt() || tunnel { b.dir } else { bi.d };
                         let (fx, fy) = if bi.p < 0.5 {
                             let t = 0.5 * (1.0 - bi.p * 2.0);
                             (0.5 - bi.d.dx() as f32 * t, 0.5 - bi.d.dy() as f32 * t)
@@ -1388,7 +1401,7 @@ impl Game {
             c.fill_rect(r.0, r.1, r.2, r.3, if hov && !locked { 0xF04A_4058 } else { PANEL });
             c.rect_outline(r.0, r.1, r.2, r.3, 2, if sel { GOLD } else { PANEL_HI });
             c.blit_ex(self.sprite(*kind, 0), r.0 + 8, r.1 + 6, 2, 0, if locked { 70 } else { 255 });
-            c.text(r.0 + 5, r.1 + 5, &format!("{}", i + 1), 1, if sel { GOLD } else { DIM });
+            c.text(r.0 + 5, r.1 + 5, &format!("{}", (i + 1) % 10), 1, if sel { GOLD } else { DIM });
             if locked {
                 c.text_center(r.0 + r.2 / 2, r.1 + 24, "ЗАКРЫТО", 1, RED);
                 c.text_center(r.0 + r.2 / 2, r.1 + 62, &format!("КОНТР.{}", kind.unlock_level()), 1, DIM);

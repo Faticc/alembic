@@ -217,6 +217,8 @@ pub enum Role {
     Overflow,
     Filter,
     Bridge,
+    /// Подземный конвейер: вход и выход смотрят в одну сторону, между ними можно строить.
+    Tunnel,
     Storage,
     Trash,
     Trade,
@@ -245,7 +247,7 @@ const fn kd(name: &'static str, info: &'static str, cost: f64, unlock: usize, ro
 pub const TAB_NAMES: [&str; 5] = ["ЛОГИСТИКА", "ЭССЕНЦИИ", "ОБРАБОТКА", "СБОРКА", "ШЕДЕВРЫ"];
 
 /// Все постройки. Индекс - постоянный идентификатор (он же пишется в сохранение), последняя - лавка.
-pub const KINDS: [KindDef; 39] = [
+pub const KINDS: [KindDef; 40] = [
     kd("КОНВЕЙЕР", "ВЕЗЁТ ПРЕДМЕТЫ. ТЯНИ МЫШЬЮ, ЧТОБЫ ПРОЛОЖИТЬ ЛИНИЮ.", 1.0, 0, Role::Belt(1.0), 0, 0x4A4E5A),
     kd("ЭКСТРАКТОР", "СТАВИТСЯ НА ЖИЛУ И КАЧАЕТ ЭССЕНЦИЮ СТИХИИ.", 20.0, 0, Role::Extractor(1.0), 1, 0x8A93A6),
     kd("СМЕСИТЕЛЬ", "СМЕШИВАЕТ ДВЕ ЭССЕНЦИИ БЕЗ ОБЩИХ СТИХИЙ В ОДНУ.", 60.0, 1, Role::Mixer, 1, 0x3FA7A0),
@@ -284,6 +286,7 @@ pub const KINDS: [KindDef; 39] = [
     kd("СКЛАД", "КОПИТ ДО 100 ОДИНАКОВЫХ ПРЕДМЕТОВ И ВЫДАЁТ ВПЕРЁД.", 100.0, 6, Role::Storage, 0, 0x9B6B43),
     kd("УТИЛИЗАТОР", "УНИЧТОЖАЕТ ВСЁ, ЧТО В НЕГО ПРИВЕЗУТ.", 10.0, 0, Role::Trash, 0, 0x3A3346),
     kd("ТОРГОВЫЙ ПОСТ", "ПРОДАЁТ НА МЕСТЕ ЗА ПОЛЦЕНЫ. В КОНТРАКТЫ НЕ ИДЁТ.", 500.0, 12, Role::Trade, 0, 0xB8873A),
+    kd("ПОДЗЕМНЫЙ КОНВЕЙЕР", "НЫРЯЕТ ПОД ПОСТРОЙКИ. ВХОД И ВЫХОД - В ОДНУ СТОРОНУ, НЕ ДАЛЬШЕ 6 КЛЕТОК.", 30.0, 4, Role::Tunnel, 0, 0x6A5A4A),
     kd("ЛАВКА АЛХИМИКА", "ПОКУПАЕТ ВСЁ, ЧТО ПРИВЕЗУТ. СЮДА СДАЮТСЯ КОНТРАКТЫ.", 0.0, 0, Role::Hub, 9, 0x5A5266),
 ];
 
@@ -328,7 +331,7 @@ impl Kind {
     }
     /// Лента или мост - то, по чему предметы едут на виду.
     pub fn is_track(self) -> bool {
-        matches!(self.role(), Role::Belt(_) | Role::Bridge)
+        matches!(self.role(), Role::Belt(_) | Role::Bridge | Role::Tunnel)
     }
     pub fn desc(self) -> String {
         match self.role() {
@@ -401,6 +404,11 @@ impl Building {
 }
 
 // ====================== стороны построек ======================
+
+/// На сколько клеток вперёд подземный конвейер ищет свой выход.
+pub const TUNNEL_RANGE: i32 = 6;
+/// Под землёй предметы едут со скоростью экспресс-ленты.
+const TUNNEL_SPEED: f32 = 2.0;
 
 pub const PORT_AUTO: u8 = 0;
 pub const PORT_IN: u8 = 1;
@@ -569,8 +577,8 @@ pub struct World {
     tick: u32,
 }
 
-fn lane_push(l: &mut Vec<BeltItem>, item: Item, d: Dir, p0: f32, tick: u32) -> bool {
-    if l.len() >= 2 {
+fn lane_push(l: &mut Vec<BeltItem>, item: Item, d: Dir, p0: f32, tick: u32, cap: usize) -> bool {
+    if l.len() >= cap {
         return false;
     }
     let mut p = p0;
@@ -1007,18 +1015,26 @@ impl World {
         }
         let tick = self.tick;
         let cap = self.storage_cap();
+        // (это выход, длина подземного участка в клетках)
+        let tunnel = if role == Role::Tunnel {
+            (self.tunnel_is_exit(x, y), self.tunnel_exit(x, y).map_or(1, |e| e.2 as usize))
+        } else {
+            (false, 1)
+        };
         let b = self.tiles[idx].as_mut().unwrap();
         let from_front = d == b.dir.opp();
         // Сторона, с которой предмет входит, и открыта ли она на приём.
         let closed = !side_in(b, rel_side(b.dir, d.opp()));
         match role {
-            Role::Belt(_) => !from_front && lane_push(&mut b.lanes[0], item, d, p0, tick),
+            Role::Belt(_) => !from_front && lane_push(&mut b.lanes[0], item, d, p0, tick, 2),
+            // Вход вмещает всё, что едет под землёй до выхода; сам выход с поверхности не принимает.
+            Role::Tunnel => !from_front && !tunnel.0 && lane_push(&mut b.lanes[0], item, d, p0, tick, 2 * tunnel.1),
             Role::Bridge => {
                 let l = &mut b.lanes[(d as usize) % 2];
                 if l.first().map_or(false, |f| f.d != d) {
                     return false;
                 }
-                lane_push(l, item, d, p0, tick)
+                lane_push(l, item, d, p0, tick, 2)
             }
             Role::Splitter | Role::Overflow | Role::Filter => {
                 if closed || b.slots[0].is_some() {
@@ -1069,7 +1085,58 @@ impl World {
         }
     }
 
+    // ---------- подземный конвейер ----------
+
+    fn tunnel_dir(&self, x: i32, y: i32) -> Option<Dir> {
+        self.get(x, y).filter(|b| b.kind.role() == Role::Tunnel).map(|b| b.dir)
+    }
+
+    /// Выход ли это: позади в пределах дальности есть подземный конвейер того же направления,
+    /// который сам не является выходом. Так цепочка в одну линию делится на пары вход-выход.
+    pub fn tunnel_is_exit(&self, x: i32, y: i32) -> bool {
+        let d = match self.tunnel_dir(x, y) {
+            Some(d) => d,
+            None => return false,
+        };
+        for k in 1..=TUNNEL_RANGE {
+            let (bx, by) = (x - d.dx() * k, y - d.dy() * k);
+            if self.tunnel_dir(bx, by) == Some(d) {
+                return !self.tunnel_is_exit(bx, by);
+            }
+        }
+        false
+    }
+
+    /// Клетка выхода для входа (x, y) и расстояние до неё; None - это выход или пары нет
+    /// (одиночный подземный конвейер работает как обычная лента).
+    pub fn tunnel_exit(&self, x: i32, y: i32) -> Option<(i32, i32, i32)> {
+        let d = self.tunnel_dir(x, y)?;
+        if self.tunnel_is_exit(x, y) {
+            return None;
+        }
+        (1..=TUNNEL_RANGE)
+            .map(|k| (x + d.dx() * k, y + d.dy() * k, k))
+            .find(|&(ex, ey, _)| self.tunnel_dir(ex, ey) == Some(d))
+    }
+
     fn advance_lane(&mut self, i: usize, x: i32, y: i32, lane: usize, out: Option<Dir>, adv: f32) {
+        self.advance_lane_to(i, x, y, lane, out, adv, 1.0, None);
+    }
+
+    /// Двигает полосу длиной `len` клеток. Если задан `exit` - это подземный участок:
+    /// доехавший предмет появляется сразу на клетке выхода.
+    #[allow(clippy::too_many_arguments)]
+    fn advance_lane_to(
+        &mut self,
+        i: usize,
+        x: i32,
+        y: i32,
+        lane: usize,
+        out: Option<Dir>,
+        adv: f32,
+        len: f32,
+        exit: Option<usize>,
+    ) {
         let tick = self.tick;
         let front = match self.tiles[i].as_ref().and_then(|b| b.lanes[lane].first()) {
             Some(f) => *f,
@@ -1079,12 +1146,17 @@ impl World {
         if front.tick != tick {
             let od = out.unwrap_or(front.d);
             let np = front.p + adv;
-            if np >= 1.0 {
-                if self.try_insert(x + od.dx(), y + od.dy(), front.item, od, (np - 1.0).min(0.45)) {
+            if np >= len {
+                let p0 = (np - len).min(0.45);
+                let moved = match exit {
+                    Some(e) => lane_push(&mut self.tiles[e].as_mut().unwrap().lanes[0], front.item, od, p0, tick, 2),
+                    None => self.try_insert(x + od.dx(), y + od.dy(), front.item, od, p0),
+                };
+                if moved {
                     self.tiles[i].as_mut().unwrap().lanes[lane].remove(0);
                     start = 0;
                 } else {
-                    self.tiles[i].as_mut().unwrap().lanes[lane][0].p = 1.0;
+                    self.tiles[i].as_mut().unwrap().lanes[lane][0].p = len;
                 }
             } else {
                 self.tiles[i].as_mut().unwrap().lanes[lane][0].p = np;
@@ -1095,7 +1167,7 @@ impl World {
             if l[j].tick == tick {
                 continue;
             }
-            let lim = if j == 0 { 1.0 } else { l[j - 1].p - 0.5 };
+            let lim = if j == 0 { len } else { l[j - 1].p - 0.5 };
             let np = (l[j].p + adv).min(lim);
             if np > l[j].p {
                 l[j].p = np;
@@ -1142,6 +1214,13 @@ impl World {
             match role {
                 Role::Hub | Role::Trash | Role::Trade => {}
                 Role::Belt(m) => self.advance_lane(i, x, y, 0, Some(dir), adv * m),
+                Role::Tunnel => match self.tunnel_exit(x, y) {
+                    Some((ex, ey, dist)) => {
+                        let e = (ey * W + ex) as usize;
+                        self.advance_lane_to(i, x, y, 0, Some(dir), adv * TUNNEL_SPEED, dist as f32, Some(e));
+                    }
+                    None => self.advance_lane(i, x, y, 0, Some(dir), adv * TUNNEL_SPEED),
+                },
                 Role::Bridge => {
                     self.advance_lane(i, x, y, 0, None, adv);
                     self.advance_lane(i, x, y, 1, None, adv);
@@ -1257,6 +1336,10 @@ impl World {
                 Role::Hub | Role::Trash | Role::Trade => false,
                 Role::Bridge => true,
                 Role::Belt(_) => n.dir == side.opp(),
+                // Вход пары уводит предметы под землю, наружу выдаёт только выход или одиночка.
+                Role::Tunnel => {
+                    n.dir == side.opp() && self.tunnel_exit(x + side.dx(), y + side.dy()).is_none()
+                }
                 _ => side_out(n, rel_side(n.dir, side.opp())),
             },
             None => false,
@@ -1269,6 +1352,7 @@ impl World {
             Some(n) => match n.kind.role() {
                 Role::Hub | Role::Trash | Role::Trade | Role::Bridge => true,
                 Role::Belt(_) => n.dir != d.opp(),
+                Role::Tunnel => n.dir != d.opp() && !self.tunnel_is_exit(x, y),
                 _ => side_in(n, rel_side(n.dir, d.opp())),
             },
             None => false,
@@ -1358,5 +1442,91 @@ impl World {
             }
         }
         Some(w)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn world() -> World {
+        let mut w = World::new(1);
+        w.money = 1e9;
+        w.level = 30;
+        w
+    }
+
+    fn run(w: &mut World, secs: f32) {
+        for _ in 0..(secs * 60.0) as u32 {
+            w.update(1.0 / 60.0);
+        }
+    }
+
+    /// Предметы проходят под постройками между входом и выходом и не попадают в них.
+    #[test]
+    fn tunnel_passes_under_buildings() {
+        let mut w = world();
+        let tunnel = Kind::by_name("ПОДЗЕМНЫЙ КОНВЕЙЕР");
+        w.veins[(10 * W + 10) as usize] = 1;
+        w.place(Kind::Extractor, 10, 10, Dir::E).unwrap();
+        w.place(Kind::Belt, 11, 10, Dir::E).unwrap();
+        w.place(tunnel, 12, 10, Dir::E).unwrap();
+        // Над подземным участком: утилизатор, который съел бы всё, и поперечная лента.
+        w.place(Kind::by_name("УТИЛИЗАТОР"), 13, 10, Dir::N).unwrap();
+        w.place(Kind::Belt, 14, 10, Dir::S).unwrap();
+        w.place(Kind::Belt, 14, 11, Dir::S).unwrap();
+        w.place(tunnel, 15, 10, Dir::E).unwrap();
+        w.place(Kind::by_name("ТОРГОВЫЙ ПОСТ"), 16, 10, Dir::N).unwrap();
+        assert!(!w.tunnel_is_exit(12, 10) && w.tunnel_is_exit(15, 10));
+        assert_eq!(w.tunnel_exit(12, 10), Some((15, 10, 3)));
+        run(&mut w, 20.0);
+        assert!(w.total_sold >= 10, "продано {}", w.total_sold);
+        assert!(w.get(14, 10).unwrap().lanes[0].is_empty() && w.get(14, 11).unwrap().lanes[0].is_empty());
+        // Выход не принимает предметы с поверхности, вход - принимает сбоку.
+        assert!(!w.try_insert(15, 10, Item::base(0), Dir::S, 0.0));
+        assert!(w.try_insert(12, 10, Item::base(0), Dir::S, 0.0));
+    }
+
+    /// Без пары и слишком далеко от пары подземный конвейер работает как обычная лента;
+    /// четыре в ряд делятся на две пары.
+    #[test]
+    fn tunnel_pairing() {
+        let mut w = world();
+        let tunnel = Kind::by_name("ПОДЗЕМНЫЙ КОНВЕЙЕР");
+        w.place(tunnel, 5, 5, Dir::S).unwrap();
+        w.place(tunnel, 5, 5 + TUNNEL_RANGE + 1, Dir::S).unwrap();
+        assert_eq!(w.tunnel_exit(5, 5), None);
+        assert!(!w.tunnel_is_exit(5, 5 + TUNNEL_RANGE + 1));
+        // Встречный и поперечный не считаются парой.
+        w.place(tunnel, 5, 7, Dir::N).unwrap();
+        w.place(tunnel, 5, 8, Dir::E).unwrap();
+        assert_eq!(w.tunnel_exit(5, 5), None);
+        for x in [20, 22, 24, 26] {
+            w.place(tunnel, x, 20, Dir::W).unwrap();
+        }
+        assert_eq!(w.tunnel_exit(26, 20), Some((24, 20, 2)));
+        assert_eq!(w.tunnel_exit(24, 20), None);
+        assert_eq!(w.tunnel_exit(22, 20), Some((20, 20, 2)));
+        // Сохранение переносит подземные конвейеры как любую постройку.
+        let back = World::load(&w.save()).unwrap();
+        assert_eq!(back.tunnel_exit(26, 20), Some((24, 20, 2)));
+    }
+
+    /// Если выход занят, предметы копятся под землёй, а не пропадают.
+    #[test]
+    fn tunnel_backs_up() {
+        let mut w = world();
+        let tunnel = Kind::by_name("ПОДЗЕМНЫЙ КОНВЕЙЕР");
+        w.veins[(10 * W + 10) as usize] = 1;
+        w.place(Kind::Extractor, 10, 10, Dir::E).unwrap();
+        w.place(tunnel, 11, 10, Dir::E).unwrap();
+        w.place(tunnel, 15, 10, Dir::E).unwrap();
+        run(&mut w, 60.0);
+        // Тупик: 2 предмета на выходе и по 2 на каждую из 4 клеток подземного участка.
+        assert_eq!(w.get(15, 10).unwrap().lanes[0].len(), 2);
+        assert_eq!(w.get(11, 10).unwrap().lanes[0].len(), 8);
+        w.place(Kind::by_name("ТОРГОВЫЙ ПОСТ"), 16, 10, Dir::N).unwrap();
+        run(&mut w, 10.0);
+        assert!(w.total_sold >= 10);
     }
 }

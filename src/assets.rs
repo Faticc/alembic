@@ -70,6 +70,7 @@ impl Assets {
                     Role::Overflow => vec![splitter(body, true)],
                     Role::Filter => vec![filter(body)],
                     Role::Bridge => vec![bridge()],
+                    Role::Tunnel => vec![tunnel(body, false), tunnel(body, true)],
                     Role::Storage => vec![storage(body)],
                     Role::Trash => vec![trash(body)],
                     Role::Trade => vec![trade(body)],
@@ -395,6 +396,36 @@ fn bridge() -> Image {
     }
     im.fill_rect(4, 0, 1, 24, shade(wood, 1.3));
     im.fill_rect(19, 0, 1, 24, shade(wood, 0.6));
+    im
+}
+
+/// Подземный конвейер: лента уходит под навес (вход) или выезжает из-под него (выход).
+/// Как и все спрайты, смотрит на север: у входа навес сверху, у выхода - снизу.
+fn tunnel(body: Color, exit: bool) -> Image {
+    let mut im = Image::new(TILE, TILE);
+    im.fill_rect(3, 0, 18, 24, BELT_RAIL);
+    im.fill_rect(4, 0, 16, 24, BELT);
+    let (hood, open) = if exit { (11, 0) } else { (0, 13) };
+    // Шевроны на открытой половине ленты.
+    for cy in [open + 1, open + 6] {
+        for i in 0..4 {
+            im.fill_rect(8 + i, cy + 3 - i, 1, 2, BELT_HI[1]);
+            im.fill_rect(15 - i, cy + 3 - i, 1, 2, BELT_HI[1]);
+        }
+    }
+    im.fill_round_rect(1, hood, 22, 13, 4.0, OUTLINE);
+    im.fill_round_rect(2, hood + 1, 20, 11, 3.0, body);
+    im.fill_rect(4, hood + 1, 16, 1, shade(body, 1.35));
+    im.fill_rect(4, hood + 11, 16, 1, shade(body, 0.7));
+    // Тёмный зев со стороны открытой ленты.
+    let mouth = if exit { hood } else { hood + 9 };
+    im.fill_rect(5, mouth, 14, 4, OUTLINE);
+    im.fill_rect(6, mouth + if exit { 0 } else { 1 }, 12, 3, PORT);
+    // Стрелка на навесе: вниз - под землю, вверх - наружу.
+    for i in 0..3 {
+        let y = if exit { hood + 8 - i } else { hood + 3 + i };
+        im.fill_rect(9 + i, y, 6 - 2 * i, 1, NOZZLE);
+    }
     im
 }
 

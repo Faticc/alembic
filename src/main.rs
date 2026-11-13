@@ -10,6 +10,7 @@
 mod assets;
 mod engine;
 mod game;
+mod megagen;
 mod net;
 mod update;
 mod world;
@@ -35,7 +36,7 @@ fn demo_world() -> World {
     w.money = 1e8;
     w.level = world::FINAL_LEVEL;
     let veins = [(30, 34, 1u8), (34, 31, 2), (30, 44, 3), (36, 36, 4), (50, 36, 1), (44, 36, 1), (50, 44, 2)];
-    for (x, y, e) in veins.into_iter().chain([(52, 31, 2), (54, 34, 1)]) {
+    for (x, y, e) in veins.into_iter().chain([(52, 31, 2), (54, 34, 1), (36, 32, 4)]) {
         w.veins[(y * world::W + x) as usize] = e;
     }
     let mut put = |name: &str, x: i32, y: i32, d: Dir| {
@@ -127,6 +128,16 @@ fn demo_world() -> World {
     put("ОБСЕРВАТОРИЯ", 54, 39, N);
     put("ГОЛЕМНАЯ", 55, 39, N);
     put("ВЕЛИКОЕ ДЕЛАНИЕ", 56, 39, N);
+    // Подземный конвейер проходит под двумя лентами и выходит на мост, повёрнутый вдоль потока.
+    put("ЭКСТРАКТОР", 36, 32, E);
+    put(belt, 37, 32, E);
+    put("ПОДЗЕМНЫЙ КОНВЕЙЕР", 38, 32, E);
+    put(belt, 39, 32, S);
+    put(belt, 40, 32, S);
+    put("ПОДЗЕМНЫЙ КОНВЕЙЕР", 41, 32, E);
+    put("МОСТ", 42, 32, E);
+    put(belt, 43, 32, E);
+    put("ТОРГОВЫЙ ПОСТ", 44, 32, N);
     w.money = 5000.0;
     w
 }
@@ -210,6 +221,24 @@ fn main() {
             .map(|i| world::Item::new((i % 15) as u8 + 1, 1, (i / 15) as u8).name())
             .collect();
         println!("sold={} earned={:.0} found={:?}", game.world.total_sold, game.world.money - money0, found);
+        return;
+    }
+
+    // Скрытые режимы мегафабрики (см. megagen.rs).
+    if let Some(path) = arg_after("--gen-megasave") {
+        megagen::generate(&path, &args);
+        return;
+    }
+    if let Some(path) = arg_after("--verify-megasave") {
+        megagen::verify(&path, &args);
+        return;
+    }
+    if let Some(path) = arg_after("--megastats") {
+        megagen::stats(&path);
+        return;
+    }
+    if let Some(path) = arg_after("--megashot") {
+        megagen::shot(&path, &arg_after("--load").unwrap_or_else(|| "megafactory_save.txt".to_string()));
         return;
     }
 
