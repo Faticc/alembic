@@ -376,6 +376,9 @@ pub struct Building {
     pub count: u32,
     /// Уровень машины 1..5: каждый следующий даёт +50% скорости.
     pub level: u8,
+    /// Режим каждой стороны относительно направления постройки:
+    /// [перёд, право, зад, лево], значения PORT_*.
+    pub ports: [u8; 4],
     rr: u8,
 }
 
@@ -391,9 +394,93 @@ impl Building {
             working: false,
             count: 0,
             level: 1,
+            ports: [PORT_AUTO; 4],
             rr: 0,
         }
     }
+}
+
+// ====================== стороны построек ======================
+
+pub const PORT_AUTO: u8 = 0;
+pub const PORT_IN: u8 = 1;
+pub const PORT_OUT: u8 = 2;
+pub const PORT_OFF: u8 = 3;
+
+/// Номер стороны относительно направления постройки: 0 перёд, 1 право, 2 зад, 3 лево.
+pub fn rel_side(facing: Dir, abs: Dir) -> usize {
+    ((abs as u8 + 4 - facing as u8) % 4) as usize
+}
+
+fn splitter_like(role: Role) -> bool {
+    matches!(role, Role::Splitter | Role::Overflow | Role::Filter)
+}
+
+/// Сколько режимов у сторон постройки: 0 - не настраивается, 3 - добыча (без входа), 4 - все.
+pub fn port_modes(kind: Kind) -> u8 {
+    match kind.role() {
+        Role::Extractor(_) => 3,
+        Role::Mixer | Role::Distiller | Role::Convert(..) | Role::Assemble(..) | Role::Storage => 4,
+        r if splitter_like(r) => 4,
+        _ => 0,
+    }
+}
+
+/// Выдаёт ли постройка предметы через эту сторону.
+/// По умолчанию машина выдаёт вперёд, делитель - вперёд и в бока. Если у машины выход
+/// назначен вручную, передняя сторона перестаёт быть выходом сама по себе.
+pub fn side_out(b: &Building, rel: usize) -> bool {
+    match b.ports[rel] {
+        PORT_OUT => true,
+        PORT_AUTO => {
+            if splitter_like(b.kind.role()) {
+                rel != 2
+            } else {
+                rel == 0 && !b.ports.contains(&PORT_OUT)
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Принимает ли постройка предметы с этой стороны.
+pub fn side_in(b: &Building, rel: usize) -> bool {
+    let role = b.kind.role();
+    if matches!(role, Role::Extractor(_)) {
+        return false;
+    }
+    match b.ports[rel] {
+        PORT_IN => true,
+        PORT_AUTO => {
+            if splitter_like(role) {
+                rel == 2
+            } else {
+                rel != 0
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Направления всех выходов постройки по порядку: перёд, право, зад, лево.
+fn out_dirs(b: &Building) -> ([Dir; 4], usize) {
+    let mut v = [Dir::N; 4];
+    let mut n = 0;
+    for rel in 0..4 {
+        if side_out(b, rel) {
+            v[n] = Dir::from_u8(b.dir as u8 + rel as u8);
+            n += 1;
+        }
+    }
+    (v, n)
+}
+
+pub fn pack_ports(p: [u8; 4]) -> u8 {
+    p[0] | p[1] << 2 | p[2] << 4 | p[3] << 6
+}
+
+pub fn unpack_ports(v: u8) -> [u8; 4] {
+    [v & 3, v >> 2 & 3, v >> 4 & 3, v >> 6 & 3]
 }
 
 // ====================== контракты ======================
@@ -760,6 +847,58 @@ impl World {
         }
     }
 
+    // ---------- стороны и фильтры ----------
+
+    /// Какой станет настройка сторон, если переключить сторону `rel` на следующий режим.
+    pub fn next_ports(&self, x: i32, y: i32, rel: usize) -> Option<u8> {
+        let b = self.get(x, y)?;
+        let mut p = b.ports;
+        p[rel] = match port_modes(b.kind) {
+            0 => return None,
+            3 => match p[rel] {
+                PORT_AUTO => PORT_OUT,
+                PORT_OUT => PORT_OFF,
+                _ => PORT_AUTO,
+            },
+            _ => (p[rel] + 1) % 4,
+        };
+        Some(pack_ports(p))
+    }
+
+    pub fn set_ports(&mut self, x: i32, y: i32, packed: u8) -> bool {
+        if !Self::inb(x, y) {
+            return false;
+        }
+        match self.tiles[(y * W + x) as usize].as_mut() {
+            Some(b) if port_modes(b.kind) > 0 => {
+                b.ports = unpack_ports(packed);
+                if port_modes(b.kind) == 3 {
+                    for p in &mut b.ports {
+                        if *p == PORT_IN {
+                            *p = PORT_AUTO;
+                        }
+                    }
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Сбрасывает образец фильтра: следующий предмет станет новым образцом.
+    pub fn filter_reset(&mut self, x: i32, y: i32) -> bool {
+        if !Self::inb(x, y) {
+            return false;
+        }
+        match self.tiles[(y * W + x) as usize].as_mut() {
+            Some(b) if b.kind.role() == Role::Filter => {
+                b.slots[1] = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
     // ---------- сетевая копия ----------
 
     /// Ставит постройку без проверок и денег (так клиент повторяет решения хоста).
@@ -870,6 +1009,8 @@ impl World {
         let cap = self.storage_cap();
         let b = self.tiles[idx].as_mut().unwrap();
         let from_front = d == b.dir.opp();
+        // Сторона, с которой предмет входит, и открыта ли она на приём.
+        let closed = !side_in(b, rel_side(b.dir, d.opp()));
         match role {
             Role::Belt(_) => !from_front && lane_push(&mut b.lanes[0], item, d, p0, tick),
             Role::Bridge => {
@@ -880,14 +1021,14 @@ impl World {
                 lane_push(l, item, d, p0, tick)
             }
             Role::Splitter | Role::Overflow | Role::Filter => {
-                if d != b.dir || b.slots[0].is_some() {
+                if closed || b.slots[0].is_some() {
                     return false;
                 }
                 b.slots[0] = Some(item);
                 true
             }
             Role::Mixer | Role::Distiller | Role::Assemble(..) => {
-                if from_front {
+                if closed {
                     return false;
                 }
                 let free = match free_slot(&b.slots) {
@@ -910,14 +1051,14 @@ impl World {
                 ok
             }
             Role::Convert(from, _, _) => {
-                if from_front || item.form != from || b.slots[0].is_some() {
+                if closed || item.form != from || b.slots[0].is_some() {
                     return false;
                 }
                 b.slots[0] = Some(item);
                 true
             }
             Role::Storage => {
-                if from_front || b.count >= cap || (b.count > 0 && b.slots[0] != Some(item)) {
+                if closed || b.count >= cap || (b.count > 0 && b.slots[0] != Some(item)) {
                     return false;
                 }
                 b.slots[0] = Some(item);
@@ -962,10 +1103,25 @@ impl World {
         }
     }
 
-    fn push_out(&mut self, i: usize, x: i32, y: i32, dir: Dir) {
-        if let Some(it) = self.tiles[i].as_ref().and_then(|b| b.out) {
-            if self.try_insert(x + dir.dx(), y + dir.dy(), it, dir, 0.0) {
-                self.tiles[i].as_mut().unwrap().out = None;
+    /// Выдаёт готовый предмет через выходы постройки; если их несколько - по очереди.
+    fn push_out(&mut self, i: usize, x: i32, y: i32, _dir: Dir) {
+        let (it, outs, n, rr) = match self.tiles[i].as_ref() {
+            Some(b) => match b.out {
+                Some(it) => {
+                    let (outs, n) = out_dirs(b);
+                    (it, outs, n, b.rr as usize)
+                }
+                None => return,
+            },
+            None => return,
+        };
+        for k in 0..n {
+            let od = outs[(rr + k) % n];
+            if self.try_insert(x + od.dx(), y + od.dy(), it, od, 0.0) {
+                let b = self.tiles[i].as_mut().unwrap();
+                b.out = None;
+                b.rr = ((rr + k + 1) % 12) as u8;
+                break;
             }
         }
     }
@@ -1052,11 +1208,20 @@ impl World {
                     self.push_out(i, x, y, dir);
                 }
                 Role::Splitter | Role::Overflow | Role::Filter => {
-                    let (it, rr, sample) = match self.tiles[i].as_ref().map(|b| (b.slots[0], b.rr, b.slots[1])) {
-                        Some((Some(it), rr, sample)) => (it, rr, sample),
-                        _ => continue,
+                    let (it, rr, sample, all4, cnt) = match self.tiles[i].as_ref() {
+                        Some(b) => match b.slots[0] {
+                            Some(it) => {
+                                let (o, n) = out_dirs(b);
+                                (it, b.rr, b.slots[1], o, n)
+                            }
+                            None => continue,
+                        },
+                        None => continue,
                     };
-                    let all = [dir, dir.cw(), dir.ccw()];
+                    if cnt == 0 {
+                        continue;
+                    }
+                    let all = &all4[..cnt];
                     let (outs, rot): (&[Dir], u8) = match role {
                         Role::Splitter => (&all[..], rr),
                         Role::Overflow => (&all[..], 0),
@@ -1076,7 +1241,7 @@ impl World {
                         if self.try_insert(x + od.dx(), y + od.dy(), it, od, 0.0) {
                             let b = self.tiles[i].as_mut().unwrap();
                             b.slots[0] = None;
-                            b.rr = (rot + k + 1) % 6;
+                            b.rr = (rot + k + 1) % 12;
                             break;
                         }
                     }
@@ -1091,8 +1256,8 @@ impl World {
             Some(n) => match n.kind.role() {
                 Role::Hub | Role::Trash | Role::Trade => false,
                 Role::Bridge => true,
-                Role::Splitter | Role::Overflow | Role::Filter => n.dir != side,
-                _ => n.dir == side.opp(),
+                Role::Belt(_) => n.dir == side.opp(),
+                _ => side_out(n, rel_side(n.dir, side.opp())),
             },
             None => false,
         }
@@ -1103,9 +1268,8 @@ impl World {
         match self.get(x, y) {
             Some(n) => match n.kind.role() {
                 Role::Hub | Role::Trash | Role::Trade | Role::Bridge => true,
-                Role::Extractor(_) => false,
-                Role::Splitter | Role::Overflow | Role::Filter => n.dir == d,
-                _ => n.dir != d.opp(),
+                Role::Belt(_) => n.dir != d.opp(),
+                _ => side_in(n, rel_side(n.dir, d.opp())),
             },
             None => false,
         }
@@ -1133,7 +1297,12 @@ impl World {
         for (i, t) in self.tiles.iter().enumerate() {
             if let Some(b) = t {
                 if b.kind != Kind::Hub {
-                    s.push_str(&format!("{} {} {} {} {}\n", i as i32 % W, i as i32 / W, b.kind.0, b.dir as u8, b.level));
+                    s.push_str(&format!("{} {} {} {} {}", i as i32 % W, i as i32 / W, b.kind.0, b.dir as u8, b.level));
+                    // Настройка сторон пишется шестым числом, только если она не по умолчанию.
+                    if b.ports != [PORT_AUTO; 4] {
+                        s.push_str(&format!(" {}", pack_ports(b.ports)));
+                    }
+                    s.push('\n');
                 }
             }
         }
@@ -1172,7 +1341,7 @@ impl World {
             }
             let v: Vec<i32> = line.split_whitespace().filter_map(|v| v.parse().ok()).collect();
             // Пятое число - уровень машины; в старых сохранениях его нет, тогда уровень 1.
-            if (v.len() != 4 && v.len() != 5) || !Self::inb(v[0], v[1]) {
+            if v.len() < 4 || v.len() > 6 || !Self::inb(v[0], v[1]) {
                 continue;
             }
             if let Some(kind) = Kind::from_u8(v[2] as u8) {
@@ -1180,6 +1349,9 @@ impl World {
                     let mut b = Building::new(kind, Dir::from_u8(v[3] as u8));
                     if Self::can_level(kind) {
                         b.level = (*v.get(4).unwrap_or(&1)).clamp(1, MAX_LEVEL as i32) as u8;
+                    }
+                    if port_modes(kind) > 0 {
+                        b.ports = unpack_ports(*v.get(5).unwrap_or(&0) as u8);
                     }
                     w.tiles[(v[1] * W + v[0]) as usize] = Some(b);
                 }

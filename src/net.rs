@@ -15,7 +15,7 @@ use steamworks::{
 
 pub const APP_ID: u32 = 480;
 /// Метка комнаты включает версию протокола: старые и новые сборки друг друга не видят.
-const LOBBY_TAG: &str = "alembic_tycoon_v2";
+const LOBBY_TAG: &str = "alembic_tycoon_v3";
 const TIMEOUT: f32 = 12.0;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -32,6 +32,8 @@ pub enum Cmd {
     BeltDir(i32, i32, Dir),
     Upgrade(u8),
     LevelUp(i32, i32),
+    SetPorts(i32, i32, u8),
+    FilterReset(i32, i32),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -40,6 +42,8 @@ pub enum Op {
     Clear(i32, i32),
     Dir(i32, i32, Dir),
     Level(i32, i32, u8),
+    Ports(i32, i32, u8),
+    FilterReset(i32, i32),
 }
 
 pub struct StateMsg {
@@ -165,6 +169,8 @@ fn enc_cmd(c: &Cmd) -> Vec<u8> {
         Cmd::BeltDir(x, y, d) => w.u8(2).i16(x).i16(y).u8(d as u8),
         Cmd::Upgrade(i) => w.u8(3).u8(i),
         Cmd::LevelUp(x, y) => w.u8(4).i16(x).i16(y),
+        Cmd::SetPorts(x, y, p) => w.u8(5).i16(x).i16(y).u8(p),
+        Cmd::FilterReset(x, y) => w.u8(6).i16(x).i16(y),
     }
     .0
 }
@@ -179,6 +185,8 @@ fn dec_cmd(r: &mut Rd) -> Option<Cmd> {
         2 => Cmd::BeltDir(r.i16()?, r.i16()?, Dir::from_u8(r.u8()?)),
         3 => Cmd::Upgrade(r.u8()?),
         4 => Cmd::LevelUp(r.i16()?, r.i16()?),
+        5 => Cmd::SetPorts(r.i16()?, r.i16()?, r.u8()?),
+        6 => Cmd::FilterReset(r.i16()?, r.i16()?),
         _ => return None,
     })
 }
@@ -190,6 +198,8 @@ fn enc_op(o: &Op) -> Vec<u8> {
         Op::Clear(x, y) => w.u8(1).i16(x).i16(y),
         Op::Dir(x, y, d) => w.u8(2).i16(x).i16(y).u8(d as u8),
         Op::Level(x, y, l) => w.u8(3).i16(x).i16(y).u8(l),
+        Op::Ports(x, y, p) => w.u8(4).i16(x).i16(y).u8(p),
+        Op::FilterReset(x, y) => w.u8(5).i16(x).i16(y),
     }
     .0
 }
@@ -203,6 +213,8 @@ fn dec_op(r: &mut Rd) -> Option<Op> {
         1 => Op::Clear(r.i16()?, r.i16()?),
         2 => Op::Dir(r.i16()?, r.i16()?, Dir::from_u8(r.u8()?)),
         3 => Op::Level(r.i16()?, r.i16()?, r.u8()?),
+        4 => Op::Ports(r.i16()?, r.i16()?, r.u8()?),
+        5 => Op::FilterReset(r.i16()?, r.i16()?),
         _ => return None,
     })
 }
@@ -649,13 +661,15 @@ mod tests {
             Cmd::BeltDir(5, 6, Dir::S),
             Cmd::Upgrade(3),
             Cmd::LevelUp(44, 36),
+            Cmd::SetPorts(3, 4, 0b10_01_11_00),
+            Cmd::FilterReset(7, 8),
         ];
         for c in cmds {
             let bytes = enc_cmd(&c);
             let back = dec_cmd(&mut Rd(&bytes[1..])).expect("decodes");
             assert_eq!(format!("{:?}", c), format!("{:?}", back));
         }
-        let ops = [Op::Set(1, 2, Kind(31), Dir::E), Op::Clear(70, 71), Op::Dir(9, 9, Dir::N), Op::Level(8, 7, 4)];
+        let ops = [Op::Set(1, 2, Kind(31), Dir::E), Op::Clear(70, 71), Op::Dir(9, 9, Dir::N), Op::Level(8, 7, 4), Op::Ports(1, 1, 200), Op::FilterReset(2, 2)];
         for o in ops {
             let bytes = enc_op(&o);
             let back = dec_op(&mut Rd(&bytes[1..])).expect("decodes");
@@ -692,6 +706,12 @@ mod tests {
                 Op::Clear(x, y) => client.force_clear(x, y),
                 Op::Dir(x, y, d) => client.set_belt_dir(x, y, d),
                 Op::Level(x, y, l) => client.force_level(x, y, l),
+                Op::Ports(x, y, p) => {
+                    client.set_ports(x, y, p);
+                }
+                Op::FilterReset(x, y) => {
+                    client.filter_reset(x, y);
+                }
             }
         }
         let tiles = |w: &World| w.save().lines().skip(3).map(String::from).collect::<Vec<_>>();
@@ -766,5 +786,58 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn belt_len(w: &World, x: i32, y: i32) -> usize {
+        w.get(x, y).map_or(0, |b| b.lanes[0].len())
+    }
+
+    /// Выход машины можно перенести на другую сторону, а сторону делителя - закрыть.
+    #[test]
+    fn configurable_sides() {
+        use crate::world::{pack_ports, PORT_AUTO, PORT_OFF, PORT_OUT};
+        let mut w = World::new(5);
+        w.money = 1e6;
+        w.level = 30;
+        let (belt, ext, split) = (Kind(0), Kind(1), Kind(3));
+        // Добыча смотрит на восток, но выход назначен направо (на юг).
+        w.veins[(10 * crate::world::W + 10) as usize] = 1;
+        w.place(ext, 10, 10, Dir::E).unwrap();
+        w.place(belt, 11, 10, Dir::E).unwrap();
+        w.place(belt, 10, 11, Dir::S).unwrap();
+        assert!(w.set_ports(10, 10, pack_ports([PORT_AUTO, PORT_OUT, PORT_AUTO, PORT_AUTO])));
+        // Делитель с закрытой левой стороной делит только вперёд и вправо.
+        w.veins[(20 * crate::world::W + 10) as usize] = 2;
+        w.place(ext, 10, 20, Dir::E).unwrap();
+        w.place(split, 11, 20, Dir::E).unwrap();
+        w.place(belt, 12, 20, Dir::E).unwrap();
+        w.place(belt, 11, 19, Dir::N).unwrap();
+        w.place(belt, 11, 21, Dir::S).unwrap();
+        assert!(w.set_ports(11, 20, pack_ports([PORT_AUTO, PORT_AUTO, PORT_AUTO, PORT_OFF])));
+        for _ in 0..400 {
+            w.update(0.05);
+        }
+        assert_eq!((belt_len(&w, 11, 10), belt_len(&w, 10, 11)), (0, 2), "выход ушёл на юг");
+        assert_eq!(belt_len(&w, 11, 19), 0, "закрытая сторона делителя пуста");
+        assert!(belt_len(&w, 12, 20) > 0 && belt_len(&w, 11, 21) > 0);
+        // Настройка сторон переживает сохранение, а строки без неё остаются в старом виде.
+        let saved = w.save();
+        assert!(saved.contains("11 20 3 1 1 192"));
+        assert!(saved.contains("11 10 0 1 1\n"));
+        let again = World::load(&saved).unwrap();
+        assert_eq!(again.get(11, 20).map(|b| b.ports), w.get(11, 20).map(|b| b.ports));
+        // Сторону можно переключать по кругу и вернуться к исходному.
+        let mut p = 0;
+        for _ in 0..4 {
+            p = w.next_ports(12, 20, 0).unwrap_or(p);
+        }
+        assert!(w.next_ports(12, 20, 0).is_none(), "у конвейера сторон нет");
+        let start = pack_ports(w.get(11, 20).unwrap().ports);
+        let mut cur = start;
+        for _ in 0..4 {
+            cur = w.next_ports(11, 20, 1).unwrap();
+            w.set_ports(11, 20, cur);
+        }
+        assert_eq!(cur, start);
     }
 }

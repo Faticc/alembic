@@ -38,6 +38,7 @@ struct ClipItem {
     kind: Kind,
     dir: Dir,
     level: u8,
+    ports: [u8; 4],
 }
 
 struct Floater {
@@ -63,6 +64,8 @@ pub struct Game {
     pub show_path: bool,
     /// Метка скачанного обновления и просьба перезапуститься (F5).
     pub update_ready: Option<String>,
+    /// Где нажали ЛКМ без инструмента: если мышь не сдвинулась, это щелчок по стороне машины.
+    click_at: Option<(i32, i32)>,
     pub restart: bool,
     /// Выделенная рамка в тайлах (x0, y0, x1, y1), включительно.
     pub sel: Option<(i32, i32, i32, i32)>,
@@ -122,6 +125,7 @@ impl Game {
             show_net: false,
             show_path: true,
             update_ready: None,
+            click_at: None,
             restart: false,
             sel: None,
             sel_start: None,
@@ -284,7 +288,7 @@ impl Game {
             for y in y0..=y1 {
                 for x in x0..=x1 {
                     if let Some(b) = self.world.get(x, y).filter(|b| b.kind != Kind::Hub) {
-                        v.push(ClipItem { dx: x - x0, dy: y - y0, kind: b.kind, dir: b.dir, level: b.level });
+                        v.push(ClipItem { dx: x - x0, dy: y - y0, kind: b.kind, dir: b.dir, level: b.level, ports: b.ports });
                     }
                 }
             }
@@ -360,6 +364,9 @@ impl Game {
                 for _ in 1..it.level {
                     self.net.send_cmd(&Cmd::LevelUp(x, y));
                 }
+                if it.ports != [PORT_AUTO; 4] {
+                    self.net.send_cmd(&Cmd::SetPorts(x, y, pack_ports(it.ports)));
+                }
                 ok += 1;
                 continue;
             }
@@ -375,6 +382,10 @@ impl Game {
                     Err(_) => break,
                 }
             }
+            let packed = pack_ports(it.ports);
+            if self.world.get(x, y).map_or(false, |b| b.ports != it.ports) && self.world.set_ports(x, y, packed) {
+                self.net.broadcast_op(&Op::Ports(x, y, packed));
+            }
         }
         if ok == items.len() {
             self.say(&format!("ВСТАВЛЕНО ПОСТРОЕК: {}", ok));
@@ -383,6 +394,62 @@ impl Game {
             self.error(&format!("ВСТАВЛЕНО {} ИЗ {}: НЕТ ДЕНЕГ ИЛИ МЕСТО НЕ ПОДХОДИТ", ok, items.len()));
         }
         ok
+    }
+
+    /// Сторона тайла, ближайшая к точке экрана: (тайл, абсолютное направление).
+    fn side_at(&self, mx: i32, my: i32) -> ((i32, i32), Dir) {
+        let (tx, ty) = self.tile_at(mx, my);
+        let (ox, oy) = self.origin();
+        let ts = self.ts();
+        let dx = mx - (ox + tx * ts) - ts / 2;
+        let dy = my - (oy + ty * ts) - ts / 2;
+        let d = if dx.abs() > dy.abs() {
+            if dx > 0 { Dir::E } else { Dir::W }
+        } else if dy > 0 {
+            Dir::S
+        } else {
+            Dir::N
+        };
+        ((tx, ty), d)
+    }
+
+    fn apply_ports(&mut self, x: i32, y: i32, packed: u8) {
+        if self.net.mode == Mode::Client {
+            self.net.send_cmd(&Cmd::SetPorts(x, y, packed));
+        } else if self.world.set_ports(x, y, packed) {
+            self.net.broadcast_op(&Op::Ports(x, y, packed));
+        }
+    }
+
+    /// Щелчок по краю машины: авто -> вход -> выход -> закрыто -> авто.
+    fn click_port(&mut self, mx: i32, my: i32) {
+        let ((x, y), d) = self.side_at(mx, my);
+        let facing = match self.world.get(x, y) {
+            Some(b) => b.dir,
+            None => return,
+        };
+        let rel = rel_side(facing, d);
+        if let Some(packed) = self.world.next_ports(x, y, rel) {
+            self.apply_ports(x, y, packed);
+            let mode = ["АВТО", "ВХОД", "ВЫХОД", "ЗАКРЫТО"][unpack_ports(packed)[rel] as usize];
+            self.say(&format!("СТОРОНА: {}", mode));
+            self.audio.play(560.0, 0.05, 0.1, Wave::Tri, 0.0);
+        }
+    }
+
+    /// Клавиша F сбрасывает образец фильтра под курсором.
+    fn filter_reset_at(&mut self, x: i32, y: i32) {
+        let is_filter = self.world.get(x, y).map_or(false, |b| b.kind.role() == Role::Filter);
+        if !is_filter {
+            return;
+        }
+        if self.net.mode == Mode::Client {
+            self.net.send_cmd(&Cmd::FilterReset(x, y));
+        } else if self.world.filter_reset(x, y) {
+            self.net.broadcast_op(&Op::FilterReset(x, y));
+        }
+        self.say("ОБРАЗЕЦ СБРОШЕН: ФИЛЬТР ЗАПОМНИТ СЛЕДУЮЩИЙ ПРЕДМЕТ");
+        self.audio.play(560.0, 0.05, 0.1, Wave::Tri, 0.0);
     }
 
     /// Улучшает машину под курсором (клавиша U).
@@ -514,6 +581,12 @@ impl Game {
                             self.net.broadcast_op(&Op::Level(x, y, l));
                         }
                     }
+                    Cmd::SetPorts(x, y, p) => self.apply_ports(x, y, p),
+                    Cmd::FilterReset(x, y) => {
+                        if self.world.filter_reset(x, y) {
+                            self.net.broadcast_op(&Op::FilterReset(x, y));
+                        }
+                    }
                     Cmd::Upgrade(i) => {
                         if (i as usize) < N_UPGRADES {
                             let _ = self.world.buy_upgrade(i as usize);
@@ -535,6 +608,12 @@ impl Game {
                     Op::Clear(x, y) => self.world.force_clear(x, y),
                     Op::Dir(x, y, d) => self.world.set_belt_dir(x, y, d),
                     Op::Level(x, y, l) => self.world.force_level(x, y, l),
+                    Op::Ports(x, y, p) => {
+                        self.world.set_ports(x, y, p);
+                    }
+                    Op::FilterReset(x, y) => {
+                        self.world.filter_reset(x, y);
+                    }
                 },
                 NetEvent::State(s) => {
                     if self.world.replica {
@@ -642,6 +721,7 @@ impl Game {
                 Key::F5 if self.update_ready.is_some() => self.restart = true,
                 Key::R => self.dir = self.dir.cw(),
                 Key::U => self.level_up_at(tx, ty),
+                Key::F => self.filter_reset_at(tx, ty),
                 Key::P => self.show_path = !self.show_path,
                 Key::Tab => {
                     self.tab = (self.tab + 1) % TAB_NAMES.len();
@@ -753,6 +833,19 @@ impl Game {
             }
             if !self.ui_captured {
                 self.world_mouse(inp, tx, ty);
+            }
+        }
+        // Щелчок без инструмента по краю машины переключает режим этой стороны.
+        let free = self.tool.is_none() && !self.pasting && !inp.shift && !self.modal();
+        if inp.lmb_pressed && free && !self.ui_captured && !self.over_ui(inp.mx, inp.my) {
+            self.click_at = Some((inp.mx, inp.my));
+        }
+        if let Some((cx, cy)) = self.click_at {
+            if (inp.mx - cx).abs() + (inp.my - cy).abs() > 6 || !free {
+                self.click_at = None;
+            } else if !inp.lmb {
+                self.click_at = None;
+                self.click_port(inp.mx, inp.my);
             }
         }
         self.cam_x = self.cam_x.clamp(0.0, W as f32);
@@ -1046,6 +1139,7 @@ impl Game {
         }
 
         // Машины.
+        let hover = Some(self.tile_at(self.mx, self.my)).filter(|_| self.tool.is_none() && !self.pasting);
         for y in y0..=y1 {
             for x in x0..=x1 {
                 let b = match w.get(x, y) {
@@ -1059,6 +1153,27 @@ impl Game {
                 for i in 0..(b.level as i32 - 1) {
                     c.fill_rect(sx + (1 + i * 4) * z, sy + 19 * z, 4 * z, 4 * z, OUTLINE);
                     c.fill_rect(sx + (2 + i * 4) * z, sy + 20 * z, 2 * z, 2 * z, GOLD);
+                }
+                // Метки сторон: у перенастроенных машин всегда, у машины под курсором - для подсказки.
+                let hovered = hover == Some((x, y));
+                if port_modes(b.kind) > 0 && (hovered || b.ports != [PORT_AUTO; 4]) {
+                    for rel in 0..4 {
+                        let col = if side_out(b, rel) {
+                            hex(0xFFB03A)
+                        } else if side_in(b, rel) {
+                            hex(0x7ED67A)
+                        } else {
+                            hex(0x8A2A2A)
+                        };
+                        let (rx, ry, rw, rh) = match Dir::from_u8(b.dir as u8 + rel as u8) {
+                            Dir::N => (8, 0, 8, 4),
+                            Dir::S => (8, 20, 8, 4),
+                            Dir::W => (0, 8, 4, 8),
+                            Dir::E => (20, 8, 4, 8),
+                        };
+                        c.fill_rect(sx + rx * z, sy + ry * z, rw * z, rh * z, OUTLINE);
+                        c.fill_rect(sx + (rx + 1) * z, sy + (ry + 1) * z, (rw - 2) * z, (rh - 2) * z, col);
+                    }
                 }
                 let (cx, cy) = (sx + ts / 2, sy + ts / 2);
                 let icon = |c: &mut Image, it: Item| c.blit(&a.items[it.id()], cx - ITEM * z / 2, cy - ITEM * z / 2, z);
@@ -1292,6 +1407,12 @@ impl Game {
                         None => format!("УР.{} (X{}) - МАКСИМУМ", b.level, level_mult(b.level)),
                     });
                 }
+                if port_modes(b.kind) > 0 {
+                    lines.push("ЛКМ ПО КРАЮ: ВХОД / ВЫХОД / ЗАКРЫТО".to_string());
+                }
+                if b.kind.role() == Role::Filter {
+                    lines.push("F - СБРОСИТЬ ОБРАЗЕЦ".to_string());
+                }
                 match b.kind.role() {
                     Role::Hub => lines.push("ПРОДАЁТ ВСЁ, ЧТО ПРИВЕЗУТ".to_string()),
                     Role::Belt(_) | Role::Bridge | Role::Trash | Role::Trade => {}
@@ -1513,6 +1634,8 @@ impl Game {
             "R              ПОВЕРНУТЬ ПОСТРОЙКУ",
             "Q              ВЗЯТЬ ПОСТРОЙКУ ПОД КУРСОРОМ",
             "U              УЛУЧШИТЬ МАШИНУ ПОД КУРСОРОМ",
+            "ЛКМ ПО КРАЮ    СТОРОНА МАШИНЫ: ВХОД / ВЫХОД / ЗАКРЫТО",
+            "F              СБРОСИТЬ ОБРАЗЕЦ ФИЛЬТРА",
             "SHIFT + ЛКМ    ВЫДЕЛИТЬ РАМКОЙ",
             "DEL            СНЕСТИ ВЫДЕЛЕННОЕ",
             "CTRL+C / X / V КОПИЯ / ПЕРЕНОС / ВСТАВКА (R - ПОВОРОТ)",

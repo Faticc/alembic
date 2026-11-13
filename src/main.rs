@@ -167,6 +167,15 @@ fn main() {
             inp.my = 240;
         }
         game.show_net = has("--netmenu");
+        if has("--ports") {
+            // Самопроверка сторон: у смесителя выход вправо, у делителя закрыта левая сторона.
+            use world::{pack_ports, PORT_AUTO, PORT_IN, PORT_OFF, PORT_OUT};
+            game.world.set_ports(34, 34, pack_ports([PORT_IN, PORT_OUT, PORT_AUTO, PORT_AUTO]));
+            game.world.set_ports(34, 44, pack_ports([PORT_AUTO, PORT_AUTO, PORT_AUTO, PORT_OFF]));
+            game.world.set_ports(46, 36, pack_ports([PORT_AUTO, PORT_AUTO, PORT_AUTO, PORT_OFF]));
+            inp.mx = 950;
+            inp.my = 312;
+        }
         if has("--select") || has("--paste") {
             // Самопроверка выделения: рамка вокруг цепочки эликсира, копия и вставка в пустое место.
             game.sel = Some((44, 36, 50, 40));
