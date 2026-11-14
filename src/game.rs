@@ -1470,7 +1470,12 @@ impl Game {
             let mut lines: Vec<String> = Vec::new();
             if let Some(b) = w.get(tx, ty) {
                 lines.push(b.kind.name().to_string());
-                if World::can_level(b.kind) {
+                if b.kind.role() == Role::Switch {
+                    lines.push(match w.level_cost(tx, ty) {
+                        Some(cost) => format!("ПЕРИОД {} С. U - ДОЛЬШЕ ЗА ${}", switch_period(b.level), fmt_money(cost)),
+                        None => format!("ПЕРИОД {} С - МАКСИМУМ", switch_period(b.level)),
+                    });
+                } else if World::can_level(b.kind) {
                     lines.push(match w.level_cost(tx, ty) {
                         Some(cost) => {
                             format!("УР.{} (X{}). U - УЛУЧШИТЬ ЗА ${}", b.level, level_mult(b.level), fmt_money(cost))

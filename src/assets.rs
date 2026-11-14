@@ -67,7 +67,7 @@ impl Assets {
                     Role::Mixer => (0..4).map(mixer).collect(),
                     Role::Distiller => (0..4).map(distiller).collect(),
                     Role::Splitter => vec![splitter(body, false)],
-                    Role::Overflow => vec![splitter(body, true)],
+                    Role::Overflow | Role::Switch => vec![splitter(body, true)],
                     Role::Filter => vec![filter(body)],
                     Role::Bridge => vec![bridge()],
                     Role::Tunnel => vec![tunnel(body, false), tunnel(body, true)],

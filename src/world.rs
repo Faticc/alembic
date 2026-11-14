@@ -80,6 +80,8 @@ pub struct Item {
 
 pub const N_FORMS: usize = 26;
 pub const N_KINDS: usize = 15 * N_FORMS;
+/// Число разных предметов с учётом чистоты: 15 смесей x 3 чистоты x 26 форм.
+pub const N_ITEM_IDS: usize = 45 * N_FORMS;
 pub const ELEM_NAMES: [&str; 4] = ["ОГОНЬ", "ВОДА", "ЗЕМЛЯ", "ЭФИР"];
 const MIX_NAMES: [&str; 16] = [
     "?", "ОГОНЬ", "ВОДА", "ПАР", "ЗЕМЛЯ", "ЛАВА", "ГЛИНА", "ОБСИДИАН", "ЭФИР", "ПЛАЗМА", "ТУМАН", "ГРОЗА", "ПЫЛЬ",
@@ -216,6 +218,8 @@ pub enum Role {
     Splitter,
     Overflow,
     Filter,
+    /// Делитель по таймеру: всё идёт в один выход, выход меняется раз в SWITCH_PERIODS[уровень] секунд.
+    Switch,
     Bridge,
     /// Подземный конвейер: вход и выход смотрят в одну сторону, между ними можно строить.
     Tunnel,
@@ -247,7 +251,7 @@ const fn kd(name: &'static str, info: &'static str, cost: f64, unlock: usize, ro
 pub const TAB_NAMES: [&str; 5] = ["ЛОГИСТИКА", "ЭССЕНЦИИ", "ОБРАБОТКА", "СБОРКА", "ШЕДЕВРЫ"];
 
 /// Все постройки. Индекс - постоянный идентификатор (он же пишется в сохранение), последняя - лавка.
-pub const KINDS: [KindDef; 40] = [
+pub const KINDS: [KindDef; 41] = [
     kd("КОНВЕЙЕР", "ВЕЗЁТ ПРЕДМЕТЫ. ТЯНИ МЫШЬЮ, ЧТОБЫ ПРОЛОЖИТЬ ЛИНИЮ.", 1.0, 0, Role::Belt(1.0), 0, 0x4A4E5A),
     kd("ЭКСТРАКТОР", "СТАВИТСЯ НА ЖИЛУ И КАЧАЕТ ЭССЕНЦИЮ СТИХИИ.", 20.0, 0, Role::Extractor(1.0), 1, 0x8A93A6),
     kd("СМЕСИТЕЛЬ", "СМЕШИВАЕТ ДВЕ ЭССЕНЦИИ БЕЗ ОБЩИХ СТИХИЙ В ОДНУ.", 60.0, 1, Role::Mixer, 1, 0x3FA7A0),
@@ -287,6 +291,7 @@ pub const KINDS: [KindDef; 40] = [
     kd("УТИЛИЗАТОР", "УНИЧТОЖАЕТ ВСЁ, ЧТО В НЕГО ПРИВЕЗУТ.", 10.0, 0, Role::Trash, 0, 0x3A3346),
     kd("ТОРГОВЫЙ ПОСТ", "ПРОДАЁТ НА МЕСТЕ ЗА ПОЛЦЕНЫ. В КОНТРАКТЫ НЕ ИДЁТ.", 500.0, 12, Role::Trade, 0, 0xB8873A),
     kd("ПОДЗЕМНЫЙ КОНВЕЙЕР", "НЫРЯЕТ ПОД ПОСТРОЙКИ. ВХОД И ВЫХОД - В ОДНУ СТОРОНУ, НЕ ДАЛЬШЕ 6 КЛЕТОК.", 30.0, 4, Role::Tunnel, 0, 0x6A5A4A),
+    kd("ПЕРЕКЛЮЧАТЕЛЬ", "ВСЁ ИДЁТ В ОДИН ВЫХОД, А ВЫХОД МЕНЯЕТСЯ ПО ТАЙМЕРУ. УРОВЕНЬ ЗАДАЁТ ПЕРИОД: 20, 40, 60, 120, 240 С.", 2000.0, 8, Role::Switch, 0, 0xC0508A),
     kd("ЛАВКА АЛХИМИКА", "ПОКУПАЕТ ВСЁ, ЧТО ПРИВЕЗУТ. СЮДА СДАЮТСЯ КОНТРАКТЫ.", 0.0, 0, Role::Hub, 9, 0x5A5266),
 ];
 
@@ -421,7 +426,14 @@ pub fn rel_side(facing: Dir, abs: Dir) -> usize {
 }
 
 fn splitter_like(role: Role) -> bool {
-    matches!(role, Role::Splitter | Role::Overflow | Role::Filter)
+    matches!(role, Role::Splitter | Role::Overflow | Role::Filter | Role::Switch)
+}
+
+/// Сколько секунд переключатель держит один выход, по уровням 1..5.
+pub const SWITCH_PERIODS: [f64; MAX_LEVEL as usize] = [20.0, 40.0, 60.0, 120.0, 240.0];
+
+pub fn switch_period(level: u8) -> f64 {
+    SWITCH_PERIODS[(level.clamp(1, MAX_LEVEL) - 1) as usize]
 }
 
 /// Сколько режимов у сторон постройки: 0 - не настраивается, 3 - добыча (без входа), 4 - все.
@@ -574,6 +586,9 @@ pub struct World {
     pub pending_new: Vec<(Item, f64)>,
     /// Копия чужого мира в сетевой игре: продажи не меняют экономику, её присылает хост.
     pub replica: bool,
+    /// Сколько штук каждого предмета (по Item::id(), с учётом чистоты) продано в лавке.
+    /// Чистая статистика для проверок: ни на что не влияет и в сохранение не пишется.
+    pub sold_by_id: Vec<u32>,
     tick: u32,
 }
 
@@ -621,6 +636,7 @@ impl World {
             discovered: vec![false; N_KINDS],
             pending_new: Vec::new(),
             replica: false,
+            sold_by_id: vec![0; N_ITEM_IDS],
             tick: 0,
         };
         w.gen_veins();
@@ -818,7 +834,7 @@ impl World {
     pub fn can_level(kind: Kind) -> bool {
         matches!(
             kind.role(),
-            Role::Extractor(_) | Role::Mixer | Role::Distiller | Role::Convert(..) | Role::Assemble(..)
+            Role::Extractor(_) | Role::Mixer | Role::Distiller | Role::Convert(..) | Role::Assemble(..) | Role::Switch
         )
     }
 
@@ -978,6 +994,9 @@ impl World {
         if !at_hub {
             return;
         }
+        if let Some(n) = self.sold_by_id.get_mut(item.id()) {
+            *n += 1;
+        }
         let c = contract(self.level);
         if item == c.item {
             self.delivered += 1;
@@ -1036,7 +1055,7 @@ impl World {
                 }
                 lane_push(l, item, d, p0, tick, 2)
             }
-            Role::Splitter | Role::Overflow | Role::Filter => {
+            Role::Splitter | Role::Overflow | Role::Filter | Role::Switch => {
                 if closed || b.slots[0].is_some() {
                     return false;
                 }
@@ -1286,12 +1305,12 @@ impl World {
                     }
                     self.push_out(i, x, y, dir);
                 }
-                Role::Splitter | Role::Overflow | Role::Filter => {
-                    let (it, rr, sample, all4, cnt) = match self.tiles[i].as_ref() {
+                Role::Splitter | Role::Overflow | Role::Filter | Role::Switch => {
+                    let (it, rr, sample, all4, cnt, level) = match self.tiles[i].as_ref() {
                         Some(b) => match b.slots[0] {
                             Some(it) => {
                                 let (o, n) = out_dirs(b);
-                                (it, b.rr, b.slots[1], o, n)
+                                (it, b.rr, b.slots[1], o, n, b.level)
                             }
                             None => continue,
                         },
@@ -1304,6 +1323,11 @@ impl World {
                     let (outs, rot): (&[Dir], u8) = match role {
                         Role::Splitter => (&all[..], rr),
                         Role::Overflow => (&all[..], 0),
+                        Role::Switch => {
+                            // Открыт ровно один выход; если он занят, предмет ждёт.
+                            let k = (self.time / switch_period(level)) as usize % cnt;
+                            (&all[k..k + 1], 0)
+                        }
                         _ => {
                             let sample = sample.unwrap_or(it);
                             self.tiles[i].as_mut().unwrap().slots[1] = Some(sample);
@@ -1510,6 +1534,32 @@ mod tests {
         // Сохранение переносит подземные конвейеры как любую постройку.
         let back = World::load(&w.save()).unwrap();
         assert_eq!(back.tunnel_exit(26, 20), Some((24, 20, 2)));
+    }
+
+    /// Переключатель пускает всё в один выход и меняет его по таймеру.
+    #[test]
+    fn switch_alternates_by_timer() {
+        let mut w = world();
+        let sw = Kind::by_name("ПЕРЕКЛЮЧАТЕЛЬ");
+        w.veins[(10 * W + 10) as usize] = 1;
+        w.place(Kind::Extractor, 10, 10, Dir::E).unwrap();
+        w.place(sw, 11, 10, Dir::E).unwrap();
+        // Вперёд - склад, вправо (на юг) - торговый пост, влево закрыто.
+        w.set_ports(11, 10, pack_ports([PORT_OUT, PORT_OUT, PORT_IN, PORT_OFF]));
+        w.place(Kind::by_name("СКЛАД"), 12, 10, Dir::E).unwrap();
+        w.set_ports(12, 10, pack_ports([PORT_OFF, PORT_OFF, PORT_IN, PORT_OFF]));
+        w.place(Kind::by_name("ТОРГОВЫЙ ПОСТ"), 11, 11, Dir::N).unwrap();
+        run(&mut w, 18.0);
+        let stored = w.get(12, 10).unwrap().count;
+        assert!(stored >= 5 && w.total_sold == 0, "первые 20 с всё идёт вперёд: {} {}", stored, w.total_sold);
+        run(&mut w, 18.0);
+        assert!(w.total_sold >= 5, "после переключения всё идёт вбок: {}", w.total_sold);
+        assert!(w.get(12, 10).unwrap().count <= stored + 2);
+        // Период задаётся уровнем и переживает сохранение.
+        w.force_level(11, 10, 3);
+        let back = World::load(&w.save()).unwrap();
+        assert_eq!(back.get(11, 10).unwrap().level, 3);
+        assert_eq!(switch_period(3), 60.0);
     }
 
     /// Если выход занят, предметы копятся под землёй, а не пропадают.

@@ -11,6 +11,7 @@ mod assets;
 mod engine;
 mod game;
 mod megagen;
+mod megagen3;
 mod net;
 mod update;
 mod world;
@@ -275,6 +276,18 @@ fn main() {
     }
     if let Some(path) = arg_after("--verify-megasave") {
         megagen::verify(&path, &args);
+        return;
+    }
+    if let Some(path) = arg_after("--gen-megasave3") {
+        megagen3::generate(&path, &args);
+        return;
+    }
+    if let Some(path) = arg_after("--verify-megasave3") {
+        megagen3::verify(&path, &args);
+        return;
+    }
+    if has("--mega3-lab") {
+        megagen3::lab(&args);
         return;
     }
     if let Some(path) = arg_after("--megastats") {
