@@ -84,6 +84,7 @@ impl Assets {
                     Role::TeleOut => (0..4).map(|fr| teleport(body, true, fr)).collect(),
                     Role::Sorter => vec![sorter(body)],
                     Role::GuildPost => vec![trade(body)],
+                    Role::Lift => (0..4).map(|fr| lift(body, fr)).collect(),
                     Role::Logic(lk) => vec![logic_part(lk, body, false), logic_part(lk, body, true)],
                     Role::Bridge => vec![bridge()],
                     Role::Tunnel => vec![tunnel(body, false), tunnel(body, true)],
@@ -528,6 +529,21 @@ fn teleport(body: Color, receiver: bool, f: i32) -> Image {
         }
     }
     im.fill_circle(12.0, 12.0, 1.4, hex(0xFFF6DC));
+    im
+}
+
+/// Лифт: шахта с клетью, которая ходит вверх-вниз; выход - вперёд.
+fn lift(body: Color, f: i32) -> Image {
+    let mut im = machine_base(body, false, false);
+    im.fill_round_rect(5, 5, 14, 14, 3.0, OUTLINE);
+    im.fill_round_rect(6, 6, 12, 12, 2.0, hex(0x14121A));
+    // Направляющие шахты и клеть на разной высоте по кадрам.
+    im.fill_rect(8, 6, 1, 12, hex(0x4A4058));
+    im.fill_rect(15, 6, 1, 12, hex(0x4A4058));
+    let y = [7, 10, 13, 10][(f % 4) as usize];
+    im.fill_rect(9, y, 6, 4, hex(0xF0C24B));
+    im.fill_rect(10, y + 1, 4, 2, hex(0x8A6A2A));
+    im.fill_rect(11, 6, 2, (y - 6).max(0), hex(0x9A93A8));
     im
 }
 

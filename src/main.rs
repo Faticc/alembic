@@ -327,6 +327,35 @@ fn demo06_world() -> World {
     put(&mut w, "ВЕНТИЛЬ ИЛИ", 30, 15, N);
     put(&mut w, "ВЕНТИЛЬ НЕ", 30, 14, N);
     put(&mut w, "ВЕНТИЛЬ И", 30, 13, N);
+    // 9. Подземелье: добыча на жиле чистоты II везёт к лифту; наверху лифт на той же клетке
+    // выдаёт на ленту к посту. Ещё один лифт внизу стоит без пары, а один наверху ждёт пару внизу.
+    {
+        let d = world::DUNGEON_Y;
+        let at = |x: i32, y: i32| ((y + d) * world::W + x) as usize;
+        for y in 17..25 {
+            for x in 31..43 {
+                w.rocks[at(x, y)] = false;
+                w.rich[at(x, y)] = false;
+            }
+        }
+        for (x, y, e) in [(32, 19, 1u8), (32, 20, 1), (33, 20, 1), (33, 19, 1), (33, 23, 2), (34, 23, 2), (34, 22, 2)] {
+            w.veins[at(x, y)] = e;
+            w.rich[at(x, y)] = true;
+        }
+        put(&mut w, "ЭКСТРАКТОР", 33, 20 + d, E);
+        for x in 34..37 {
+            put(&mut w, belt, x, 20 + d, E);
+        }
+        put(&mut w, "ЛИФТ", 37, 20 + d, E);
+        put(&mut w, "ЛИФТ", 37, 20, E);
+        put(&mut w, belt, 38, 20, E);
+        put(&mut w, belt, 39, 20, E);
+        put(&mut w, post, 40, 20, N);
+        put(&mut w, "ЭКСТРАКТОР", 34, 23 + d, E);
+        put(&mut w, belt, 35, 23 + d, E);
+        put(&mut w, "ЛИФТ", 36, 23 + d, E);
+        put(&mut w, "ЛИФТ", 40, 18, E);
+    }
     w.rep = [4, 7, 1, 10];
     w.money = 2.5e7;
     w
@@ -371,6 +400,8 @@ fn demo06_shot(path: &str, args: &[String]) {
     game.show_wires = has("--wires");
     game.show_guild = has("--guild");
     game.show_great = has("--great");
+    // `--layer 1` - кадр подземелья (камера задаётся в координатах слоя, как на поверхности).
+    game.layer = nums("--layer").map_or(0, |v| v[0] as i32).clamp(0, 1);
     if has("--library") {
         // Для кадра библиотеки: два чертежа из показательной фабрики (второй - со схемой логики).
         game.world.money = 1e9;

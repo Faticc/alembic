@@ -989,6 +989,9 @@ mod tests {
     fn codec_roundtrip() {
         let cmds = [
             Cmd::Place(Kind(17), 79, 3, Dir::W),
+            // Клетка подземелья: строки второго слоя лежат дальше строк поверхности.
+            Cmd::Place(Kind(62), 79, crate::world::ROWS - 1, Dir::S),
+            Cmd::Remove(0, crate::world::DUNGEON_Y),
             Cmd::Remove(12, 40),
             Cmd::BeltDir(5, 6, Dir::S),
             Cmd::Upgrade(3),
@@ -1007,7 +1010,7 @@ mod tests {
             let back = dec_cmd(&mut Rd(&bytes[1..])).expect("decodes");
             assert_eq!(format!("{:?}", c), format!("{:?}", back));
         }
-        let ops = [Op::Set(1, 2, Kind(31), Dir::E), Op::Clear(70, 71), Op::Dir(9, 9, Dir::N), Op::Level(8, 7, 4), Op::Ports(1, 1, 200), Op::FilterReset(2, 2), Op::Cfg(3, 3, u64::MAX), Op::LClear(4, 4), Op::LCfg(5, 5, 77)];
+        let ops = [Op::Set(1, 2, Kind(31), Dir::E), Op::Set(79, crate::world::ROWS - 1, Kind(62), Dir::N), Op::Clear(70, 71), Op::Dir(9, 9, Dir::N), Op::Level(8, 7, 4), Op::Ports(1, 1, 200), Op::FilterReset(2, 2), Op::Cfg(3, 3, u64::MAX), Op::LClear(4, 4), Op::LCfg(5, 5, 77)];
         for o in ops {
             let bytes = enc_op(&o);
             let back = dec_op(&mut Rd(&bytes[1..])).expect("decodes");

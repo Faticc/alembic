@@ -221,6 +221,8 @@ pub struct Game {
     state_n: u32,
     /// Показан ли слой проводов (клавиша L; сам включается, когда в руках деталь логики).
     pub show_wires: bool,
+    /// Какой слой карты на экране: 0 - поверхность, 1 - подземелье (клавиша Z).
+    pub layer: i32,
     /// Окно настройки открыто для детали логики, а не для постройки.
     pub cfg_node: bool,
     /// Счётчик кадров в углу (F3); `fps` и `frame_ms` присылает главный цикл.
@@ -360,6 +362,7 @@ impl Game {
             prestige_arm: false,
             state_n: 0,
             show_wires: false,
+            layer: 0,
             cfg_node: false,
             show_fps: true,
             fps: 0.0,
@@ -690,9 +693,25 @@ impl Game {
         TILE * self.zoom
     }
 
+    /// Экранные координаты тайла (0, 0) мира. Подземелье лежит в мире ниже поверхности, поэтому
+    /// при взгляде на него начало отсчёта уезжает вверх на высоту слоя: камера остаётся над той
+    /// же клеткой, а всё, что рисуется по координатам мира, попадает на свой слой само.
     fn origin(&self) -> (i32, i32) {
         let ts = self.ts() as f32;
-        (self.w / 2 - (self.cam_x * ts).round() as i32, self.h / 2 - (self.cam_y * ts).round() as i32)
+        let cy = self.cam_y + (self.layer * DUNGEON_Y) as f32;
+        (self.w / 2 - (self.cam_x * ts).round() as i32, self.h / 2 - (cy * ts).round() as i32)
+    }
+
+    /// Z: спуститься в подземелье или подняться. Камера остаётся над той же клеткой.
+    pub fn switch_layer(&mut self) {
+        self.layer = 1 - self.layer;
+        self.sel = None;
+        self.sel_start = None;
+        self.drag_tile = None;
+        self.rdrag_tile = None;
+        self.show_cfg = None;
+        self.say(if self.layer == 1 { "ПОДЗЕМЕЛЬЕ: ЖИЛЫ ЧИСТОТЫ II. Z - НАВЕРХ" } else { "ПОВЕРХНОСТЬ" });
+        self.audio.play(if self.layer == 1 { 330.0 } else { 520.0 }, 0.1, 0.1, Wave::Tri, 0.0);
     }
 
     fn tile_at(&self, mx: i32, my: i32) -> (i32, i32) {
@@ -2050,6 +2069,7 @@ let rate = format!("КРОЛИЧЬЯ НОРА: ВСЁ, ЧТО ВОШЛО В ПЕ
                     self.show_bp = v;
                     self.bp_name.clear();
                 }
+                Key::Z if !inp.ctrl => self.switch_layer(),
                 Key::L => {
                     self.show_wires = !self.show_wires;
                     self.say(if self.show_wires { "СЛОЙ ПРОВОДОВ ПОКАЗАН" } else { "СЛОЙ ПРОВОДОВ СКРЫТ" });
@@ -2435,7 +2455,10 @@ let rate = format!("КРОЛИЧЬЯ НОРА: ВСЁ, ЧТО ВОШЛО В ПЕ
         let x0 = (-ox).div_euclid(ts).max(0);
         let y0 = (-oy).div_euclid(ts).max(0);
         let x1 = (c.w - 1 - ox).div_euclid(ts).min(W - 1);
-        let y1 = (c.h - 1 - oy).div_euclid(ts).min(H - 1);
+        // Рисуется только свой слой: строки поверхности или строки подземелья.
+        let base = self.layer * DUNGEON_Y;
+        let y0 = y0.max(base);
+        let y1 = (c.h - 1 - oy).div_euclid(ts).min(base + H - 1);
         let a = &self.assets;
         let w = &self.world;
         let anim = (self.time * 8.0) as usize;
@@ -2456,6 +2479,17 @@ let rate = format!("КРОЛИЧЬЯ НОРА: ВСЁ, ЧТО ВОШЛО В ПЕ
                     for (dx, dy) in [(5, 5), (17, 8), (9, 17)] {
                         c.fill_rect(ox + x * ts + dx * z, oy + y * ts + dy * z, 2 * z, 2 * z, hex(0xFFF6DC));
                     }
+                }
+            }
+        }
+
+        // Под землёй темно: пол и порода приглушены, жилы и постройки остаются яркими.
+        if self.layer == 1 {
+            for y in y0..=y1 {
+                for x in x0..=x1 {
+                    let i = (y * W + x) as usize;
+                    let dark = if w.rocks[i] { 0xD00C_0A14 } else if w.veins[i] > 0 { 0x500C_0A14 } else { 0xA80C_0A14 };
+                    c.fill_rect(ox + x * ts, oy + y * ts, ts, ts, dark);
                 }
             }
         }
@@ -2658,6 +2692,26 @@ let rate = format!("КРОЛИЧЬЯ НОРА: ВСЁ, ЧТО ВОШЛО В ПЕ
             }
         }
 
+        // Лифты: на другом слое на той же клетке должна стоять пара. Место под пару показано
+        // призраком, лифт без пары обведён красным.
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                let is_lift = |x: i32, y: i32| w.get(x, y).map_or(false, |b| b.kind.role() == Role::Lift);
+                let (px, py) = other_layer(x, y);
+                let (sx, sy) = (ox + x * ts, oy + y * ts);
+                match (is_lift(x, y), is_lift(px, py)) {
+                    (false, true) => {
+                        if w.get(x, y).is_none() {
+                            c.blit_ex(self.sprite(Kind::by_name("ЛИФТ"), 0), sx, sy, z, w.get(px, py).map_or(0, |b| b.dir as u8), 110);
+                        }
+                        c.rect_outline(sx, sy, ts, ts, z, 0xE058_D4F0);
+                    }
+                    (true, false) => c.rect_outline(sx, sy, ts, ts, z, RED),
+                    _ => {}
+                }
+            }
+        }
+
         // Остановленные исполнителем постройки помечены всегда; сам слой сигналов - по клавише L.
         let wires = self.wires_on();
         if wires {
@@ -2769,12 +2823,16 @@ let rate = format!("КРОЛИЧЬЯ НОРА: ВСЁ, ЧТО ВОШЛО В ПЕ
         for p in &self.net.peers {
             let col = [hex(0x58B4F0), hex(0xF07AD8), hex(0x7ED67A), hex(0xFFB03A)][(p.id.raw() % 4) as usize];
             let pr = &p.p;
+            // Игрок на другом слое карты здесь не виден.
+            if layer_of(pr.y) != self.layer {
+                continue;
+            }
             let (sx, sy) = (ox + pr.x * ts, oy + pr.y * ts);
             let mut label_y = sy;
             let mut label = p.name.clone();
             if pr.mode > 0 {
-                let (rx0, ry0) = (pr.rect.0.clamp(-1, W), pr.rect.1.clamp(-1, H));
-                let (rx1, ry1) = (pr.rect.2.clamp(rx0, W), pr.rect.3.clamp(ry0, H));
+                let (rx0, ry0) = (pr.rect.0.clamp(-1, W), pr.rect.1.clamp(base - 1, base + H));
+                let (rx1, ry1) = (pr.rect.2.clamp(rx0, W), pr.rect.3.clamp(ry0, base + H));
                 let (px, py) = (ox + rx0 * ts, oy + ry0 * ts);
                 let (pw, ph) = ((rx1 - rx0 + 1) * ts, (ry1 - ry0 + 1) * ts);
                 c.fill_rect(px, py, pw, ph, with_alpha(col, if pr.mode == 1 { 0x38 } else { 0x20 }));
@@ -2802,6 +2860,9 @@ let rate = format!("КРОЛИЧЬЯ НОРА: ВСЁ, ЧТО ВОШЛО В ПЕ
         let a = &self.assets;
         let hover_ui = self.over_ui(self.mx, self.my);
 
+        if self.layer == 1 {
+            c.text_center(c.w / 2, TOP_H + 12, "ПОДЗЕМЕЛЬЕ  (Z - НАВЕРХ)", 2, hex(0x58D4F0));
+        }
         // Верхняя панель: деньги, доход, контракт.
         c.fill_rect(0, 0, c.w, TOP_H, PANEL);
         c.fill_rect(0, TOP_H, c.w, 2, PANEL_HI);
@@ -3017,6 +3078,19 @@ let rate = format!("КРОЛИЧЬЯ НОРА: ВСЁ, ЧТО ВОШЛО В ПЕ
                         }
                         None => lines.push("КОД НЕ ЗАДАН - НЕ РАБОТАЕТ".to_string()),
                     },
+                    Role::Lift => {
+                        let (px, py) = other_layer(tx, ty);
+                        let pair = w.get(px, py).map_or(false, |p| p.kind.role() == Role::Lift);
+                        let to = if layer_of(ty) == 0 { "В ПОДЗЕМЕЛЬЕ" } else { "НА ПОВЕРХНОСТЬ" };
+                        if pair {
+                            lines.push(format!("ВЕЗЁТ {}: {} С, В ШАХТЕ {} ИЗ {}", to, LIFT_TIME, b.lanes[0].len(), LIFT_QUEUE));
+                        } else {
+                            lines.push("ПАРЫ НЕТ: ПОСТАВЬ ЛИФТ НА ЭТОЙ ЖЕ КЛЕТКЕ ДРУГОГО СЛОЯ (Z)".to_string());
+                        }
+                        if let Some(o) = b.out {
+                            lines.push(format!("ПРИЕХАЛО: {}", o.name()));
+                        }
+                    }
                     Role::Sorter => {
                         for (k, side) in ["ВПЕРЁД", "ВПРАВО", "ВЛЕВО"].iter().enumerate() {
                             let cond = sorter_cond(b.cfg, k);
@@ -3447,8 +3521,8 @@ let rate = format!("КРОЛИЧЬЯ НОРА: ВСЁ, ЧТО ВОШЛО В ПЕ
             "G / V          ГИЛЬДИИ И ЗАКАЗЫ / ВИТРАЖ И НОВЫЙ ВИТОК",
             "F2             СЕТЕВАЯ ИГРА ЧЕРЕЗ STEAM",
             "F3 / F11       СЧЁТЧИК FPS / ПОЛНЫЙ ЭКРАН",
-            "WASD / ЛКМ     ДВИГАТЬ КАМЕРУ",
-            "КОЛЕСО         МАСШТАБ",
+            "Z              ПОДЗЕМЕЛЬЕ / ПОВЕРХНОСТЬ (СВЯЗЬ - ЛИФТЫ)",
+            "WASD, КОЛЕСО   КАМЕРА, МАСШТАБ",
             "B              БИБЛИОТЕКА ЧЕРТЕЖЕЙ: БУФЕР ПОД ИМЕНЕМ",
             "M / F1         ЗВУК ВКЛ/ВЫКЛ / ЭТА СПРАВКА",
             "ИГРА ОБНОВЛЯЕТСЯ САМА; F5 - ПЕРЕЗАПУСК ПОСЛЕ СКАЧИВАНИЯ.",
@@ -3690,6 +3764,59 @@ mod tests {
         assert_eq!((first[0].items[0].dir, first[0].items[0].level), (Dir::from_u8(1), 1), "направление и уровень приведены к допустимым");
         assert_eq!(first[0].nodes[0].param, 9999, "настройка детали обрезана до допустимой");
         assert_eq!(bp_from_text(&bp_to_text(&first)), first);
+    }
+
+    /// Z переключает слой: камера остаётся над той же клеткой, мышь попадает в тайлы подземелья,
+    /// порода сносится ПКМ за деньги, лифты ставятся парой на одной клетке двух слоёв.
+    #[test]
+    fn dungeon_view_switches_and_builds() {
+        let mut g = game();
+        g.cam_x = 20.5;
+        g.cam_y = 20.5;
+        g.update(&Input::default(), DT, 1280, 720);
+        assert_eq!(g.tile_at(640, 360), (20, 20));
+        key(&mut g, Key::Z, false);
+        assert_eq!((g.layer, g.tile_at(640, 360)), (1, (20, 20 + DUNGEON_Y)));
+        let i = ((20 + DUNGEON_Y) * W + 20) as usize;
+        g.world.rocks[i] = true;
+        g.world.veins[i] = 0;
+        let lift = Kind::by_name("ЛИФТ");
+
+        // В породу лифт не встаёт.
+        g.tool = Some(lift);
+        click_xy(&mut g, 640, 360);
+        assert!(g.world.get(20, 20 + DUNGEON_Y).is_none());
+        // ПКМ без постройки в руках сносит породу за ROCK_COST.
+        g.tool = None;
+        let money = g.world.money;
+        g.update(&Input { mx: 640, my: 360, rmb: true, rmb_pressed: true, ..Default::default() }, DT, 1280, 720);
+        g.update(&Input { mx: 640, my: 360, ..Default::default() }, DT, 1280, 720);
+        assert!(!g.world.rocks[i] && g.world.money == money - ROCK_COST);
+        g.tool = Some(lift);
+        click_xy(&mut g, 640, 360);
+        assert_eq!(g.world.get(20, 20 + DUNGEON_Y).map(|b| b.kind), Some(lift));
+        assert!(g.world.get(20, 20).is_none(), "на поверхности пока пусто");
+
+        // Оба слоя рисуются без сбоев: и с лифтом без пары, и с призраком пары наверху.
+        let mut c = Image::new(1280, 720);
+        g.draw(&mut c);
+        key(&mut g, Key::Z, false);
+        assert_eq!((g.layer, g.tile_at(640, 360)), (0, (20, 20)));
+        g.draw(&mut c);
+        g.tool = Some(lift);
+        click_xy(&mut g, 640, 360);
+        assert_eq!(g.world.get(20, 20).map(|b| b.kind), Some(lift));
+        g.draw(&mut c);
+
+        // Буфер обмена переносится между слоями: скопировано наверху, вставлено внизу.
+        g.world.place(Kind(0), 21, 20, Dir::E).unwrap();
+        g.sel = Some((21, 20, 21, 20));
+        g.copy_selection(false);
+        key(&mut g, Key::Z, false);
+        assert!(g.pasting && g.sel.is_none());
+        g.world.rocks[i + 3] = false;
+        assert_eq!(g.paste_at(23, 20 + DUNGEON_Y), 1);
+        assert!(g.world.get(23, 20 + DUNGEON_Y).is_some());
     }
 
     #[test]

@@ -13,3 +13,6 @@ megafactory_save.txt
 
 # Настройки окна (полный экран, счётчик FPS)
 alembic_settings.txt
+
+# Библиотека чертежей игрока
+alembic_blueprints.txt

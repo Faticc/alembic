@@ -5,6 +5,26 @@ use crate::engine::Rng;
 
 pub const W: i32 = 80;
 pub const H: i32 = 80;
+/// Подземелье - второй слой карты. Он лежит в тех же массивах ниже поверхности, через полосу
+/// пустых строк: ни подземный конвейер, ни аура алтаря, ни провод через неё не дотягиваются,
+/// поэтому слои связаны только лифтами. Строка поверхности y - это строка y + DUNGEON_Y подземелья.
+pub const LAYER_GAP: i32 = 16;
+pub const DUNGEON_Y: i32 = H + LAYER_GAP;
+/// Всего строк в массивах мира (поверхность, пустая полоса, подземелье).
+pub const ROWS: i32 = DUNGEON_Y + H;
+/// Лифт везёт предмет между слоями столько секунд и держит в шахте не больше стольких предметов.
+pub const LIFT_TIME: f32 = 1.0;
+pub const LIFT_QUEUE: usize = 4;
+
+/// Слой строки: 0 - поверхность, 1 - подземелье.
+pub fn layer_of(y: i32) -> i32 {
+    (y >= DUNGEON_Y) as i32
+}
+
+/// Тот же тайл на другом слое.
+pub fn other_layer(x: i32, y: i32) -> (i32, i32) {
+    (x, if y >= DUNGEON_Y { y - DUNGEON_Y } else { y + DUNGEON_Y })
+}
 pub const HUB_X: i32 = 39;
 pub const HUB_Y: i32 = 39;
 pub const N_UPGRADES: usize = 8;
@@ -387,6 +407,8 @@ pub enum Role {
     Logic(Lk),
     /// Гильдейская лавка: принимает товар как сама лавка алхимика (полная цена, контракты, заказы).
     GuildPost,
+    /// Лифт: всё, что вошло сзади или сбоку, выходит спереди у лифта на той же клетке другого слоя.
+    Lift,
     Bridge,
     /// Подземный конвейер: вход и выход смотрят в одну сторону, между ними можно строить.
     Tunnel,
@@ -440,7 +462,7 @@ const fn kd(name: &'static str, info: &'static str, cost: f64, unlock: usize, ro
 pub const TAB_NAMES: [&str; 7] = ["ЛОГИСТИКА", "ЭССЕНЦИИ", "ОБРАБОТКА", "СБОРКА", "ШЕДЕВРЫ", "ТАИНСТВА", "ЛОГИКА"];
 
 /// Все постройки. Индекс - постоянный идентификатор (он же пишется в сохранение), последняя - лавка.
-pub const KINDS: [KindDef; 63] = [
+pub const KINDS: [KindDef; 64] = [
     kd("КОНВЕЙЕР", "ВЕЗЁТ ПРЕДМЕТЫ. ТЯНИ МЫШЬЮ, ЧТОБЫ ПРОЛОЖИТЬ ЛИНИЮ.", 1.0, 0, Role::Belt(1.0), 0, 0x4A4E5A),
     kd("ЭКСТРАКТОР", "СТАВИТСЯ НА ЖИЛУ И КАЧАЕТ ЭССЕНЦИЮ СТИХИИ.", 20.0, 0, Role::Extractor(1.0), 1, 0x8A93A6),
     kd("СМЕСИТЕЛЬ", "СМЕШИВАЕТ ДВЕ ЭССЕНЦИИ БЕЗ ОБЩИХ СТИХИЙ В ОДНУ.", 60.0, 1, Role::Mixer, 1, 0x3FA7A0),
@@ -503,6 +525,7 @@ pub const KINDS: [KindDef; 63] = [
     kd("СЧЁТЧИК", "КАЖДЫЙ N-Й ИМПУЛЬС СЗАДИ ДАЁТ ИМПУЛЬС ВПЕРЁД (E - ЧИСЛО N). ВХОД СБОКУ ОБНУЛЯЕТ СЧЁТ.", 250.0, 7, Role::Logic(Lk::Counter), 6, 0x6E8B3D),
     kd("ИСПОЛНИТЕЛЬ", "УПРАВЛЯЕТ ПОСТРОЙКОЙ ПОД СОБОЙ: ВОРОТА НА ЛЕНТЕ, ОСТАНОВ МАШИНЫ, ВЫХОД ПЕРЕКЛЮЧАТЕЛЯ (E - РЕЖИМ).", 300.0, 5, Role::Logic(Lk::Act), 6, 0xF0C24B),
     kd("ГИЛЬДЕЙСКАЯ ЛАВКА", "ФИЛИАЛ ЛАВКИ: ПОЛНАЯ ЦЕНА, КОНТРАКТЫ И ЗАКАЗЫ. ОТКРЫВАЕТСЯ ПРИ РЕПУТАЦИИ 10 В ЛЮБОЙ ГИЛЬДИИ.", 150000.0, 0, Role::GuildPost, 0, 0x8A2A4A),
+    kd("ЛИФТ", "СВЯЗЫВАЕТ ПОВЕРХНОСТЬ И ПОДЗЕМЕЛЬЕ (Z): ВОШЕДШЕЕ СЗАДИ ИЛИ СБОКУ ВЫХОДИТ СПЕРЕДИ У ЛИФТА НА ТОЙ ЖЕ КЛЕТКЕ ДРУГОГО СЛОЯ.", 20000.0, 8, Role::Lift, 0, 0x6A7F92),
     kd("ЛАВКА АЛХИМИКА", "ПОКУПАЕТ ВСЁ, ЧТО ПРИВЕЗУТ. СЮДА СДАЮТСЯ КОНТРАКТЫ.", 0.0, 0, Role::Hub, 9, 0x5A5266),
 ];
 
@@ -1155,6 +1178,9 @@ pub struct World {
     tele_rr: Vec<u16>,
     /// Постройки или алтари изменились: ауры пересчитываются перед следующим шагом.
     dirty: bool,
+    /// Номер тайла сразу за последней постройкой: дальше шаг симуляции не ходит. Пока в
+    /// подземелье пусто, оно не стоит ни такта. Пересчитывается вместе с `dirty`.
+    tile_end: usize,
     tick: u32,
 }
 
@@ -1186,7 +1212,7 @@ fn free_slot(slots: &[Option<Item>; 2]) -> Option<usize> {
 
 impl World {
     pub fn new(seed: u64) -> World {
-        let n = (W * H) as usize;
+        let n = (W * ROWS) as usize;
         let mut w = World {
             tiles: (0..n).map(|_| None).collect(),
             veins: vec![0; n],
@@ -1243,9 +1269,11 @@ impl World {
             tele_last: vec![u32::MAX; TELE_CODES],
             tele_rr: vec![0; TELE_CODES],
             dirty: true,
+            tile_end: n,
             tick: 0,
         };
         w.gen_veins();
+        w.gen_dungeon();
         for y in HUB_Y..HUB_Y + 3 {
             for x in HUB_X..HUB_X + 3 {
                 w.tiles[(y * W + x) as usize] = Some(Building::new(Kind::Hub, Dir::N));
@@ -1301,6 +1329,67 @@ impl World {
         }
     }
 
+    /// Подземелье: сплошная порода, в ней пещеры и жилы чистоты II. Свой генератор случайных
+    /// чисел и свои строки массивов - карта поверхности от него не зависит. Подземелье есть
+    /// у любого мира, в том числе у старых сохранений: на поверхности в них ничего не меняется.
+    fn gen_dungeon(&mut self) {
+        let mut rng = Rng::new(self.seed ^ 0xD0_6E0E_5EED);
+        let idx = |x: i32, y: i32| ((y + DUNGEON_Y) * W + x) as usize;
+        let inside = |x: i32, y: i32| x >= 1 && y >= 1 && x < W - 1 && y < H - 1;
+        for y in 0..H {
+            for x in 0..W {
+                self.rocks[idx(x, y)] = true;
+            }
+        }
+        // Пещеры: блуждание из случайной точки. Первая - зал под лавкой, туда спускается первый лифт.
+        let (cx, cy) = (HUB_X + 1, HUB_Y + 1);
+        for k in 0..22 {
+            let (mut x, mut y, n) = if k == 0 { (cx, cy, 260) } else { (rng.range(4, W - 4), rng.range(4, H - 4), rng.range(60, 170)) };
+            for _ in 0..n {
+                for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                    if inside(x + dx, y + dy) {
+                        self.rocks[idx(x + dx, y + dy)] = false;
+                    }
+                }
+                let d = Dir::from_u8(rng.range(0, 4) as u8);
+                let (nx, ny) = (x + d.dx(), y + d.dy());
+                if inside(nx, ny) {
+                    x = nx;
+                    y = ny;
+                }
+            }
+        }
+        // Жилы: по одной каждой стихии недалеко от зала и россыпь по всей карте. Жила всегда
+        // открыта (породы над ней нет) и вся - чистоты II.
+        let mut spots: Vec<(i32, i32, u8, i32)> = Vec::new();
+        for (e, (dx, dy)) in [(-11, -9), (11, -9), (-11, 9), (11, 9)].iter().enumerate() {
+            spots.push((cx + dx + rng.range(-2, 3), cy + dy + rng.range(-2, 3), e as u8 + 1, 14));
+        }
+        for _ in 0..26 {
+            spots.push((rng.range(4, W - 4), rng.range(4, H - 4), rng.range(1, 5) as u8, rng.range(8, 22)));
+        }
+        for (x, y, e, n) in spots {
+            let mut cells = vec![(x, y)];
+            let mut guard = 0;
+            while (cells.len() as i32) < n && guard < 600 {
+                guard += 1;
+                let (bx, by) = cells[rng.range(0, cells.len() as i32) as usize];
+                let d = Dir::from_u8(rng.range(0, 4) as u8);
+                let p = (bx + d.dx(), by + d.dy());
+                if inside(p.0, p.1) && !cells.contains(&p) {
+                    cells.push(p);
+                }
+            }
+            for (x, y) in cells {
+                if inside(x, y) && self.veins[idx(x, y)] == 0 {
+                    self.veins[idx(x, y)] = e;
+                    self.rich[idx(x, y)] = true;
+                    self.rocks[idx(x, y)] = false;
+                }
+            }
+        }
+    }
+
     fn gen_veins(&mut self) {
         let mut rng = Rng::new(self.seed);
         let (cx, cy) = (HUB_X + 1, HUB_Y + 1);
@@ -1342,8 +1431,9 @@ impl World {
         }
     }
 
+    /// Есть ли такой тайл: на поверхности или в подземелье (полоса между слоями - не карта).
     pub fn inb(x: i32, y: i32) -> bool {
-        x >= 0 && y >= 0 && x < W && y < H
+        x >= 0 && x < W && ((y >= 0 && y < H) || (y >= DUNGEON_Y && y < ROWS))
     }
 
     pub fn get(&self, x: i32, y: i32) -> Option<&Building> {
@@ -2332,6 +2422,7 @@ impl World {
     /// настроек или смены изделия на алтаре.
     fn rebuild(&mut self) {
         self.dirty = false;
+        self.tile_end = self.tiles.iter().rposition(|t| t.is_some()).map_or(0, |i| i + 1);
         self.tele_rx.clear();
         self.tele_tx.clear();
         for (i, t) in self.tiles.iter().enumerate() {
@@ -2353,8 +2444,12 @@ impl World {
         }
         self.aura_on = !altars.is_empty();
         for a in &altars {
-            for y in (a.y - a.r).max(0)..=(a.y + a.r).min(H - 1) {
+            for y in a.y - a.r..=a.y + a.r {
                 for x in (a.x - a.r).max(0)..=(a.x + a.r).min(W - 1) {
+                    // Аура не выходит за свой слой карты.
+                    if !Self::inb(x, y) || layer_of(y) != layer_of(a.y) {
+                        continue;
+                    }
                     let t = &mut self.aura[(y * W + x) as usize];
                     for k in 0..3 {
                         t[k] = t[k].max(a.s[k]);
@@ -2551,6 +2646,16 @@ impl World {
                 None => false,
             };
         }
+        if role == Role::Lift {
+            // Шахта лифта: предмет входит сзади или сбоку и едет на другой слой.
+            let tick = self.tick;
+            let b = self.tiles[idx].as_mut().unwrap();
+            if !side_in(b, rel_side(b.dir, d.opp())) || b.lanes[0].len() >= LIFT_QUEUE {
+                return false;
+            }
+            b.lanes[0].push(BeltItem { item, p: 0.0, d, tick });
+            return true;
+        }
         if role == Role::TeleIn {
             // Передатчик берёт с любой стороны всё подряд: предмет сразу улетает в нору.
             let tick = self.tick;
@@ -2685,7 +2790,7 @@ impl World {
                 true
             }
             Role::Extractor(_) | Role::Hub | Role::Trade | Role::Trash | Role::Altar | Role::TeleIn | Role::TeleOut => false,
-            Role::Logic(_) | Role::GuildPost => false,
+            Role::Logic(_) | Role::GuildPost | Role::Lift => false,
         }
     }
 
@@ -2839,7 +2944,7 @@ impl World {
         if self.dirty {
             self.rebuild();
         }
-        for i in 0..self.tiles.len() {
+        for i in 0..self.tile_end {
             let (role, dir) = match &self.tiles[i] {
                 Some(b) => (b.kind.role(), b.dir),
                 None => continue,
@@ -2926,6 +3031,26 @@ impl World {
                 Role::TeleOut => {
                     let b = self.tiles[i].as_mut().unwrap();
                     b.working = b.out.is_some();
+                    self.push_out(i, x, y, dir);
+                }
+                Role::Lift => {
+                    // Предметы в шахте едут LIFT_TIME секунд; доехавший появляется на выходе
+                    // лифта, стоящего на той же клетке другого слоя. Нет пары или её выход
+                    // занят - предмет ждёт в шахте.
+                    let b = self.tiles[i].as_mut().unwrap();
+                    b.working = !b.lanes[0].is_empty() || b.out.is_some();
+                    for bi in &mut b.lanes[0] {
+                        bi.p = (bi.p + dt / LIFT_TIME).min(1.0);
+                    }
+                    let ready = b.lanes[0].first().filter(|bi| bi.p >= 1.0).map(|bi| bi.item);
+                    let (px, py) = other_layer(x, y);
+                    let j = (py * W + px) as usize;
+                    if let Some(it) = ready {
+                        if self.tiles[j].as_ref().map_or(false, |p| p.kind.role() == Role::Lift && p.out.is_none()) {
+                            self.tiles[j].as_mut().unwrap().out = Some(it);
+                            self.tiles[i].as_mut().unwrap().lanes[0].remove(0);
+                        }
+                    }
                     self.push_out(i, x, y, dir);
                 }
                 Role::TeleIn => {
@@ -3202,7 +3327,8 @@ impl World {
         for i in &self.cleared {
             s.push_str(&format!("X {} {}\n", *i as i32 % W, *i as i32 / W));
         }
-        for (i, r) in self.rich.iter().enumerate() {
+        // Жилы подземелья богаты все и строятся из сида - в файл идут только жилы поверхности.
+        for (i, r) in self.rich.iter().enumerate().take((W * H) as usize) {
             if *r {
                 s.push_str(&format!("R {} {}\n", i as i32 % W, i as i32 / W));
             }
@@ -3385,6 +3511,9 @@ impl World {
 
 #[cfg(test)]
 mod tests {
+    /// Тайлов на поверхности: с них начинаются массивы мира, дальше идёт подземелье.
+    const SURF: usize = (W * H) as usize;
+    const SURFACE_PRINTS: [u64; 8] = [9463873357429317846, 1552872169230026933, 3272100103422972823, 14437395782824934539, 13116129493162979599, 6389591778916320494, 8197222072363785347, 13689199417849666374];
     use super::*;
 
     fn world() -> World {
@@ -4268,11 +4397,11 @@ mod tests {
         assert!(!w.set_skin(1) && !w.unlocked(post));
         w.add_rep(0, 3);
         assert!(w.set_skin(1) && !w.set_skin(2) && w.skin == 1);
-        assert!(!w.rich.iter().any(|r| *r));
+        assert!(!w.rich[..SURF].iter().any(|r| *r));
         w.add_rep(0, 3);
-        let n = w.rich.iter().filter(|r| **r).count();
+        let n = w.rich[..SURF].iter().filter(|r| **r).count();
         assert!(n >= 6, "жила огня у лавки стала богатой: {} клеток", n);
-        let i = w.rich.iter().position(|r| *r).unwrap() as i32;
+        let i = w.rich[..SURF].iter().position(|r| *r).unwrap() as i32;
         assert_eq!(w.veins[i as usize], 1);
         w.place(Kind::Extractor, i % W, i / W, Dir::E).unwrap();
         w.place(Kind::by_name("СКЛАД"), i % W + 1, i / W, Dir::E).unwrap();
@@ -4340,17 +4469,17 @@ mod tests {
     fn map_features_only_in_new_games() {
         for seed in [1u64, 11, 1120, 987_654_321] {
             let (old, new) = (World::new(seed), World::new_game(seed));
-            assert!(!old.rocks.iter().any(|r| *r) && !old.rich.iter().any(|r| *r));
+            assert!(!old.rocks[..SURF].iter().any(|r| *r) && !old.rich[..SURF].iter().any(|r| *r));
             // Старое сохранение (без строки M) - карта в точности прежняя.
             let legacy = format!("ALEMBIC1\n100 0 0 0 0 0 0 {}\n10 10 0 1 1\n", seed);
             let w = World::load(&legacy).unwrap();
             assert_eq!((w.veins.clone(), w.map_ver), (old.veins.clone(), 0));
-            assert!(!w.rocks.iter().any(|r| *r) && !w.rich.iter().any(|r| *r));
-            assert!(!World::load(&w.save()).unwrap().rocks.iter().any(|r| *r), "пересохранение не добавляет преград");
+            assert!(!w.rocks[..SURF].iter().any(|r| *r) && !w.rich[..SURF].iter().any(|r| *r));
+            assert!(!World::load(&w.save()).unwrap().rocks[..SURF].iter().any(|r| *r), "пересохранение не добавляет преград");
             // Новая игра: преграды не на жилах и не у лавки, разломы - богатые жилы вдали.
-            let (rocks, rifts) = (new.rocks.iter().filter(|r| **r).count(), new.rich.iter().filter(|r| **r).count());
+            let (rocks, rifts) = (new.rocks[..SURF].iter().filter(|r| **r).count(), new.rich[..SURF].iter().filter(|r| **r).count());
             assert!(rocks >= 100 && (18..=30).contains(&rifts), "сид {}: преград {}, клеток разломов {}", seed, rocks, rifts);
-            for i in 0..new.veins.len() {
+            for i in 0..SURF {
                 let d = (i as i32 % W - HUB_X - 1).abs().max((i as i32 / W - HUB_Y - 1).abs());
                 assert!(!(new.rocks[i] && (new.veins[i] > 0 || d < 8)));
                 assert!(!new.rich[i] || (new.veins[i] > 0 && d >= 25));
@@ -4362,16 +4491,16 @@ mod tests {
         // Преграда мешает строить; снос стоит денег и запоминается.
         let mut w = World::new_game(1);
         w.money = 5000.0;
-        let i = w.rocks.iter().position(|r| *r).unwrap() as i32;
+        let i = w.rocks[..SURF].iter().position(|r| *r).unwrap() as i32;
         let (x, y) = (i % W, i / W);
         assert!(w.place(Kind::Belt, x, y, Dir::E).is_err());
         assert!(w.remove(x, y) && w.money == 5000.0 - ROCK_COST && !w.rocks[i as usize]);
         assert_eq!(w.place(Kind::Belt, x, y, Dir::E), Ok(true));
         let back = World::load(&w.save()).unwrap();
         assert!(!back.rocks[i as usize] && back.get(x, y).is_some());
-        assert_eq!(back.rocks.iter().filter(|r| **r).count(), w.rocks.iter().filter(|r| **r).count());
+        assert_eq!(back.rocks[..SURF].iter().filter(|r| **r).count(), w.rocks[..SURF].iter().filter(|r| **r).count());
         w.money = 10.0;
-        let j = w.rocks.iter().position(|r| *r).unwrap() as i32;
+        let j = w.rocks[..SURF].iter().position(|r| *r).unwrap() as i32;
         assert!(!w.remove(j % W, j / W), "без денег преграду не снести");
     }
 
@@ -4671,6 +4800,148 @@ mod tests {
         let money = w.money;
         assert!(w.remove_logic(30, 30) && w.node(30, 30).is_none());
         assert_eq!(w.money, money + 200.0, "цена таймера возвращается");
+    }
+
+    /// Подземелье: свой слой карты с породой и жилами чистоты II, со поверхностью связан только лифтами.
+    #[test]
+    fn dungeon_layer_and_lifts() {
+        let k = Kind::by_name;
+        let d = DUNGEON_Y;
+        let at = |x: i32, y: i32| (y * W + x) as usize;
+        let mut w = World::new(11);
+        w.money = 1e7;
+        w.level = FINAL_LEVEL;
+
+        // Геометрия: два слоя и полоса между ними, которая картой не считается.
+        assert!(World::inb(0, 0) && World::inb(W - 1, H - 1) && World::inb(0, d) && World::inb(W - 1, ROWS - 1));
+        assert!(!World::inb(0, H) && !World::inb(0, d - 1) && !World::inb(0, ROWS) && !World::inb(W, d));
+        assert_eq!((other_layer(5, 7), other_layer(5, 7 + d)), ((5, 7 + d), (5, 7)));
+        assert_eq!((layer_of(H - 1), layer_of(d)), (0, 1));
+        assert!(w.place(Kind(0), 5, H, Dir::E).is_err() && w.place(Kind(0), 5, d - 1, Dir::E).is_err());
+        assert!(w.place(k("ПРОВОД"), 5, H + 3, Dir::N).is_err(), "и детали логики в полосу не ставятся");
+
+        // Карта: породы больше половины, под лавкой зал, у зала жилы всех стихий, все жилы богатые.
+        for seed in [11u64, 1, 77, 123_456_789] {
+            let g = World::new(seed);
+            let cells: Vec<usize> = (0..H).flat_map(|y| (0..W).map(move |x| at(x, y + d))).collect();
+            let rocks = cells.iter().filter(|i| g.rocks[**i]).count();
+            let veins = cells.iter().filter(|i| g.veins[**i] > 0).count();
+            assert!((3000..=5200).contains(&rocks) && (250..=700).contains(&veins), "сид {}: породы {}, жил {}", seed, rocks, veins);
+            assert!(cells.iter().all(|i| g.veins[*i] == 0 || (g.rich[*i] && !g.rocks[*i])), "жилы открыты и чистоты II");
+            assert!(!g.rocks[at(HUB_X + 1, HUB_Y + 1 + d)], "зал под лавкой");
+            for e in 1..=4u8 {
+                let near = cells.iter().any(|i| {
+                    let (x, y) = (*i as i32 % W, *i as i32 / W - d);
+                    g.veins[*i] == e && (x - HUB_X - 1).abs().max((y - HUB_Y - 1).abs()) <= 16
+                });
+                assert!(near, "сид {}: стихия {} рядом с залом", seed, e);
+            }
+            // Тот же сид - та же карта.
+            let again = World::new(seed);
+            assert!(again.rocks == g.rocks && again.veins == g.veins && again.rich == g.rich);
+        }
+
+        // Порода: строить нельзя, пока не снесёшь за деньги; снесённое помнит сохранение.
+        let rock = (0..H).flat_map(|y| (0..W).map(move |x| (x, y + d))).find(|&(x, y)| w.rocks[at(x, y)]).unwrap();
+        assert!(w.place(Kind(0), rock.0, rock.1, Dir::E).is_err());
+        let money = w.money;
+        assert!(w.remove(rock.0, rock.1) && w.money == money - ROCK_COST);
+        assert_eq!(w.place(Kind(0), rock.0, rock.1, Dir::E), Ok(true));
+
+        // Дальше порода под постройки убирается так же, как в игре: сносом за деньги.
+        let dig = |w: &mut World, x: i32, y: i32| {
+            if w.rocks[(y * W + x) as usize] {
+                assert!(w.remove(x, y));
+            }
+        };
+        // Подземный конвейер у нижнего края поверхности не находит пару в подземелье.
+        let tun = k("ПОДЗЕМНЫЙ КОНВЕЙЕР");
+        dig(&mut w, 10, d);
+        w.place(tun, 10, H - 1, Dir::S).unwrap();
+        w.place(tun, 10, d, Dir::S).unwrap();
+        assert!(w.tunnel_exit(10, H - 1).is_none() && !w.tunnel_is_exit(10, d));
+
+        // Линия снизу вверх: добыча на богатой жиле в подземелье -> лента -> лифт; наверху лифт
+        // на той же клетке -> лента -> лавка.
+        let (lx, y) = (HUB_X - 3, HUB_Y + 1);
+        for x in lx - 2..=lx {
+            dig(&mut w, x, y + d);
+            w.veins[at(x, y + d)] = 0;
+        }
+        w.veins[at(lx - 2, y + d)] = 1;
+        w.rich[at(lx - 2, y + d)] = true;
+        w.place(Kind(1), lx - 2, y + d, Dir::E).unwrap();
+        w.place(Kind(0), lx - 1, y + d, Dir::E).unwrap();
+        w.place(k("ЛИФТ"), lx, y + d, Dir::E).unwrap();
+        w.place(Kind(0), lx + 1, y, Dir::E).unwrap();
+        w.place(Kind(0), lx + 2, y, Dir::E).unwrap();
+        let run = |w: &mut World, secs: u32| (0..secs * 60).for_each(|_| w.update(1.0 / 60.0));
+        // Пока наверху нет пары, предметы копятся в шахте и дальше не идут.
+        run(&mut w, 15);
+        assert_eq!(w.total_sold, 0);
+        assert_eq!(w.get(lx, y + d).unwrap().lanes[0].len(), LIFT_QUEUE);
+        w.place(k("ЛИФТ"), lx, y, Dir::E).unwrap();
+        run(&mut w, 20);
+        let fire2 = Item::new(1, 2, 0);
+        assert!(w.total_sold >= 8 && w.discovered[fire2.id()], "наверх приехал огонь чистоты II: продано {}", w.total_sold);
+
+        // Сверху вниз лифт везёт так же (пара работает в обе стороны сразу):
+        // предмет, вошедший в верхний лифт сзади, выходит спереди у нижнего через LIFT_TIME.
+        let (sx, sy) = (20, 20);
+        dig(&mut w, sx, sy + d);
+        dig(&mut w, sx + 1, sy + d);
+        w.place(k("ЛИФТ"), sx, sy, Dir::E).unwrap();
+        w.place(k("ЛИФТ"), sx, sy + d, Dir::E).unwrap();
+        w.place(k("СКЛАД"), sx + 1, sy + d, Dir::E).unwrap();
+        assert!(!w.try_insert(sx, sy, fire2, Dir::W, 0.0), "спереди лифт не принимает");
+        assert!(w.try_insert(sx, sy, fire2, Dir::E, 0.0));
+        (0..54).for_each(|_| w.update(1.0 / 60.0));
+        let held = |w: &World| w.get(sx + 1, sy + d).map_or(0, |s| s.count + s.out.is_some() as u32);
+        assert_eq!(held(&w), 0, "за 0.9 с предмет ещё едет");
+        (0..18).for_each(|_| w.update(1.0 / 60.0));
+        assert_eq!((held(&w), w.get(sx + 1, sy + d).unwrap().slots[0]), (1, Some(fire2)), "склад держит предмет (внутри или на выдаче)");
+        // Шахта вмещает не больше LIFT_QUEUE предметов разом.
+        let pushed = (0..10).filter(|_| w.try_insert(sx, sy, fire2, Dir::E, 0.0)).count();
+        assert_eq!(pushed, LIFT_QUEUE);
+
+        // Сохранение несёт постройки подземелья и снесённую породу; дальше всё работает так же.
+        let mut back = World::load(&w.save()).expect("сохранение читается");
+        assert!(back.rocks == w.rocks && back.veins[..(W * H) as usize] == w.veins[..(W * H) as usize]);
+        // Жила под добычей в этом тесте поставлена руками, в файле её нет - добыча на ней не загрузилась.
+        assert_eq!(back.tiles.iter().flatten().count() + 1, w.tiles.iter().flatten().count());
+        assert_eq!(back.get(lx, y + d).map(|b| (b.kind, b.dir)), Some((k("ЛИФТ"), Dir::E)));
+        assert!(back.get(rock.0, rock.1).is_some() && !back.rocks[at(rock.0, rock.1)]);
+        let sold = back.total_sold;
+        back.veins[at(lx - 2, y + d)] = 1;
+        back.rich[at(lx - 2, y + d)] = true;
+        back.money = 1e6;
+        back.place(Kind(1), lx - 2, y + d, Dir::E).unwrap();
+        run(&mut back, 20);
+        assert!(back.total_sold >= sold + 8, "после загрузки линия снова везёт наверх");
+
+        // Новый виток сносит и подземелье.
+        w.stones_now = 1;
+        w.prestige().unwrap();
+        assert!(w.get(lx, y + d).is_none() && w.get(sx, sy).is_none());
+    }
+
+    /// Отпечаток карты поверхности: жилы, а для новой игры ещё преграды и разломы.
+    fn surface_print(w: &World) -> u64 {
+        let mut h = 0xCBF2_9CE4_8422_2325u64;
+        for i in 0..(W * H) as usize {
+            for v in [w.veins[i], w.rocks[i] as u8, w.rich[i] as u8] {
+                h = (h ^ v as u64).wrapping_mul(0x0100_0000_01B3);
+            }
+        }
+        h
+    }
+
+    /// Карта поверхности у существующих сидов не меняется: отпечатки сняты до появления подземелья.
+    #[test]
+    fn surface_map_is_stable() {
+        let got: Vec<u64> = [1u64, 7, 42, 1_700_000_000_123].iter().flat_map(|s| [surface_print(&World::new(*s)), surface_print(&World::new_game(*s))]).collect();
+        println!("ОТПЕЧАТКИ: {:?}", got);
+        assert_eq!(got, SURFACE_PRINTS);
     }
 
     /// Память деталей (защёлка, счётчик) переживает сохранение; копия мира в сети своим лентам
