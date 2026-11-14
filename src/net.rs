@@ -4,7 +4,7 @@
 //! хост применяет их и рассылает всем результат и состояние экономики. Предметы на
 //! лентах каждый клиент досчитывает сам - они только для вида.
 
-use crate::world::{Dir, Kind, N_KINDS};
+use crate::world::{Dir, Kind, N_ALL_IDS};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use steamworks::networking_messages::SessionRequest;
 use steamworks::networking_types::{NetworkingIdentity, SendFlags};
@@ -15,7 +15,7 @@ use steamworks::{
 
 pub const APP_ID: u32 = 480;
 /// Метка комнаты включает версию протокола: старые и новые сборки друг друга не видят.
-const LOBBY_TAG: &str = "alembic_tycoon_v5";
+const LOBBY_TAG: &str = "alembic_tycoon_v7";
 const TIMEOUT: f32 = 12.0;
 /// Как часто мерить пинг, секунды.
 const PING_EVERY: f32 = 1.0;
@@ -41,6 +41,15 @@ pub enum Cmd {
     LevelUp(i32, i32),
     SetPorts(i32, i32, u8),
     FilterReset(i32, i32),
+    /// Настройка постройки: образец фильтра, пропорция, код телепорта, сторона отказа.
+    SetCfg(i32, i32, u64),
+    /// Слой сигналов: снять деталь, задать её настройку.
+    LRemove(i32, i32),
+    LCfg(i32, i32, u64),
+    /// Гильдии и виток: взять заказ, сменить скин лент, начать новый виток.
+    Order(u8),
+    Skin(u8),
+    Prestige,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -51,6 +60,9 @@ pub enum Op {
     Level(i32, i32, u8),
     Ports(i32, i32, u8),
     FilterReset(i32, i32),
+    Cfg(i32, i32, u64),
+    LClear(i32, i32),
+    LCfg(i32, i32, u64),
 }
 
 pub struct StateMsg {
@@ -59,7 +71,11 @@ pub struct StateMsg {
     pub delivered: u32,
     pub upgrades: [u8; 8],
     pub income: f32,
+    /// Время мира хоста: по нему клиент сверяет фазу переключателей.
+    pub time: f64,
     pub discovered: Vec<bool>,
+    /// Остальная экономика (рынок, гильдии, мегапроект, виток) - строками, как в сохранении.
+    pub extra: String,
 }
 
 pub enum NetEvent {
@@ -70,6 +86,8 @@ pub enum NetEvent {
     /// Клиенту: снимок мира, изменение постройки, состояние экономики.
     World(String),
     Op(Op),
+    /// Клиенту: состояние слоя сигналов хоста (номер такта и состояние деталей по порядку).
+    Logic(u64, Vec<(bool, u32, bool)>),
     State(StateMsg),
     Info(String),
     /// Клиенту: связь с хостом потеряна, пора вернуться в свою игру.
@@ -142,6 +160,56 @@ const T_BYE: u8 = 8;
 /// Замер пинга: отправитель кладёт своё время, получатель возвращает его как есть.
 const T_PING: u8 = 9;
 const T_PONG: u8 = 10;
+const T_LOGIC: u8 = 11;
+
+/// Состояние слоя сигналов: номер такта, число деталей и по 5 байт на деталь.
+pub fn enc_logic(ticks: u64, st: &[(bool, u32, bool)]) -> Vec<u8> {
+    let mut w = Wr::new(T_LOGIC).u64(ticks).u32(st.len() as u32);
+    for s in st {
+        w = w.u8(s.0 as u8 | (s.2 as u8) << 1).u32(s.1);
+    }
+    w.0
+}
+
+fn dec_logic(r: &mut Rd) -> Option<(u64, Vec<(bool, u32, bool)>)> {
+    let ticks = r.u64()?;
+    let n = r.u32()? as usize;
+    let mut v = Vec::new();
+    for _ in 0..n.min(100_000) {
+        let f = r.u8()?;
+        v.push((f & 1 == 1, r.u32()?, f & 2 == 2));
+    }
+    Some((ticks, v))
+}
+
+/// Состояние экономики хоста одним сообщением.
+pub fn enc_state(s: &StateMsg) -> Vec<u8> {
+    let mut w = Wr::new(T_STATE).u64(s.money.to_bits()).u32(s.level).u32(s.delivered);
+    for u in s.upgrades {
+        w = w.u8(u);
+    }
+    w = w.u32(s.income.to_bits()).u64(s.time.to_bits());
+    let mut bits = vec![0u8; (N_ALL_IDS + 7) / 8];
+    for (i, d) in s.discovered.iter().enumerate().take(N_ALL_IDS) {
+        if *d {
+            bits[i / 8] |= 1 << (i % 8);
+        }
+    }
+    w.0.extend_from_slice(&bits);
+    w.str(&s.extra).0
+}
+
+fn dec_state(r: &mut Rd) -> Option<StateMsg> {
+    let money = f64::from_bits(r.u64()?);
+    let (level, delivered) = (r.u32()?, r.u32()?);
+    let upgrades = [r.u8()?, r.u8()?, r.u8()?, r.u8()?, r.u8()?, r.u8()?, r.u8()?, r.u8()?];
+    let income = f32::from_bits(r.u32()?);
+    let time = f64::from_bits(r.u64()?);
+    let bits = r.take((N_ALL_IDS + 7) / 8)?;
+    let discovered = (0..N_ALL_IDS).map(|i| bits[i / 8] >> (i % 8) & 1 == 1).collect();
+    let extra = r.str()?;
+    Some(StateMsg { money, level, delivered, upgrades, income, time, discovered, extra })
+}
 
 struct Wr(Vec<u8>);
 
@@ -212,6 +280,12 @@ fn enc_cmd(c: &Cmd) -> Vec<u8> {
         Cmd::LevelUp(x, y) => w.u8(4).i16(x).i16(y),
         Cmd::SetPorts(x, y, p) => w.u8(5).i16(x).i16(y).u8(p),
         Cmd::FilterReset(x, y) => w.u8(6).i16(x).i16(y),
+        Cmd::SetCfg(x, y, v) => w.u8(7).i16(x).i16(y).u64(v),
+        Cmd::LRemove(x, y) => w.u8(8).i16(x).i16(y),
+        Cmd::LCfg(x, y, v) => w.u8(9).i16(x).i16(y).u64(v),
+        Cmd::Order(i) => w.u8(10).u8(i),
+        Cmd::Skin(i) => w.u8(11).u8(i),
+        Cmd::Prestige => w.u8(12),
     }
     .0
 }
@@ -228,6 +302,12 @@ fn dec_cmd(r: &mut Rd) -> Option<Cmd> {
         4 => Cmd::LevelUp(r.i16()?, r.i16()?),
         5 => Cmd::SetPorts(r.i16()?, r.i16()?, r.u8()?),
         6 => Cmd::FilterReset(r.i16()?, r.i16()?),
+        7 => Cmd::SetCfg(r.i16()?, r.i16()?, r.u64()?),
+        8 => Cmd::LRemove(r.i16()?, r.i16()?),
+        9 => Cmd::LCfg(r.i16()?, r.i16()?, r.u64()?),
+        10 => Cmd::Order(r.u8()?),
+        11 => Cmd::Skin(r.u8()?),
+        12 => Cmd::Prestige,
         _ => return None,
     })
 }
@@ -241,6 +321,9 @@ fn enc_op(o: &Op) -> Vec<u8> {
         Op::Level(x, y, l) => w.u8(3).i16(x).i16(y).u8(l),
         Op::Ports(x, y, p) => w.u8(4).i16(x).i16(y).u8(p),
         Op::FilterReset(x, y) => w.u8(5).i16(x).i16(y),
+        Op::Cfg(x, y, v) => w.u8(6).i16(x).i16(y).u64(v),
+        Op::LClear(x, y) => w.u8(7).i16(x).i16(y),
+        Op::LCfg(x, y, v) => w.u8(8).i16(x).i16(y).u64(v),
     }
     .0
 }
@@ -256,6 +339,9 @@ fn dec_op(r: &mut Rd) -> Option<Op> {
         3 => Op::Level(r.i16()?, r.i16()?, r.u8()?),
         4 => Op::Ports(r.i16()?, r.i16()?, r.u8()?),
         5 => Op::FilterReset(r.i16()?, r.i16()?),
+        6 => Op::Cfg(r.i16()?, r.i16()?, r.u64()?),
+        7 => Op::LClear(r.i16()?, r.i16()?),
+        8 => Op::LCfg(r.i16()?, r.i16()?, r.u64()?),
         _ => return None,
     })
 }
@@ -442,6 +528,25 @@ impl Net {
         }
     }
 
+    /// Хост: разослать всем новый снимок мира (после нового витка карта пустая).
+    pub fn broadcast_world(&self, text: &str) {
+        if self.mode == Mode::Host {
+            self.broadcast(&Wr::new(T_WORLD).str(text).0, true);
+        }
+    }
+
+    /// Отмечает достижение в Steam, если клиент подключён. В тестовом приложении Spacewar
+    /// наших достижений нет - тогда Steam просто отказывает, игра показывает достижение сама.
+    pub fn achievement(&self, id: &str) -> bool {
+        match &self.client {
+            Some(c) => {
+                let stats = c.user_stats();
+                stats.achievement(id).set().is_ok() && stats.store_stats().is_ok()
+            }
+            None => false,
+        }
+    }
+
     pub fn send_world(&self, to: SteamId, text: &str) {
         self.send(to, &Wr::new(T_WORLD).str(text).0, true);
     }
@@ -456,19 +561,13 @@ impl Net {
     }
 
     pub fn broadcast_state(&self, s: &StateMsg) {
-        let mut w = Wr::new(T_STATE).u64(s.money.to_bits()).u32(s.level).u32(s.delivered);
-        for u in s.upgrades {
-            w = w.u8(u);
+        self.broadcast(&enc_state(s), true);
+    }
+
+    pub fn broadcast_logic(&self, ticks: u64, st: &[(bool, u32, bool)]) {
+        if !st.is_empty() {
+            self.broadcast(&enc_logic(ticks, st), true);
         }
-        w = w.u32(s.income.to_bits());
-        let mut bits = vec![0u8; (N_KINDS + 7) / 8];
-        for (i, d) in s.discovered.iter().enumerate().take(N_KINDS) {
-            if *d {
-                bits[i / 8] |= 1 << (i % 8);
-            }
-        }
-        w.0.extend_from_slice(&bits);
-        self.broadcast(&w.0, true);
     }
 
     /// Подставной игрок для скриншота-самопроверки (в сеть ничего не уходит).
@@ -580,17 +679,13 @@ impl Net {
                         }
                     }
                     T_STATE if self.synced => {
-                        let st = (|| {
-                            let money = f64::from_bits(r.u64()?);
-                            let (level, delivered) = (r.u32()?, r.u32()?);
-                            let upgrades = [r.u8()?, r.u8()?, r.u8()?, r.u8()?, r.u8()?, r.u8()?, r.u8()?, r.u8()?];
-                            let income = f32::from_bits(r.u32()?);
-                            let bits = r.take((N_KINDS + 7) / 8)?;
-                            let discovered = (0..N_KINDS).map(|i| bits[i / 8] >> (i % 8) & 1 == 1).collect();
-                            Some(StateMsg { money, level, delivered, upgrades, income, discovered })
-                        })();
-                        if let Some(st) = st {
+                        if let Some(st) = dec_state(&mut r) {
                             out.push(NetEvent::State(st));
+                        }
+                    }
+                    T_LOGIC if self.synced => {
+                        if let Some((ticks, st)) = dec_logic(&mut r) {
+                            out.push(NetEvent::Logic(ticks, st));
                         }
                     }
                     T_CURSORS => {
@@ -775,6 +870,121 @@ mod tests {
         assert_eq!(net.ping(), None);
     }
 
+    /// Хост и клиент после 5 минут симуляции совпадают по деньгам, ценам рынка, гильдиям,
+    /// мегапроекту и состоянию сигналов. Сообщения идут через настоящие кодеки и разбор клиента.
+    #[test]
+    fn host_and_client_agree_after_five_minutes() {
+        use crate::world::{Item, HUB_X, HUB_Y, W};
+        let k = Kind::by_name;
+        let mut host = World::new(3);
+        host.money = 1e6;
+        host.level = 12;
+        // Две линии в лавку, на одной - ворота по таймеру и счётчик предметов.
+        for (y, e) in [(HUB_Y, 1u8), (HUB_Y + 2, 2)] {
+            host.veins[(y * W + HUB_X - 4) as usize] = e;
+            host.place(Kind(1), HUB_X - 4, y, Dir::E).unwrap();
+            for x in HUB_X - 3..HUB_X {
+                host.place(Kind(0), x, y, Dir::E).unwrap();
+            }
+        }
+        let (x, y) = (HUB_X - 2, HUB_Y);
+        host.place(k("ИСПОЛНИТЕЛЬ"), x, y, Dir::N).unwrap();
+        host.place(k("ПРОВОД"), x, y - 1, Dir::N).unwrap();
+        host.place(k("ТАЙМЕР"), x, y - 2, Dir::S).unwrap();
+        host.set_lparam(x, y - 2, 70);
+        host.place(k("ДАТЧИК ПРЕДМЕТА"), x + 1, y, Dir::N).unwrap();
+        host.place(k("СЧЁТЧИК"), x + 1, y - 1, Dir::N).unwrap();
+        host.set_lparam(x + 1, y - 1, 5);
+        host.place(k("ЗАЩЁЛКА"), x + 1, y - 2, Dir::N).unwrap();
+        let frame = |w: &mut World| w.update(1.0 / 60.0);
+        (0..1200).for_each(|_| frame(&mut host));
+        host.take_order(0).unwrap();
+
+        // Клиент входит через 20 секунд: получает снимок мира, дальше считает сам и слушает хоста.
+        let mut client = World::load(&host.save()).expect("снимок читается");
+        client.replica = true;
+        let mut net = Net::new();
+        net.mode = Mode::Client;
+        net.host = Some(SteamId::from_raw(1));
+        net.synced = true;
+        // Внеочередная рассылка логики: хост шлёт её, когда сработал датчик (не чаще 10 раз в секунду).
+        let push_logic = |host: &World, client: &mut World, net: &mut Net| {
+            let mut evs = Vec::new();
+            net.handle(SteamId::from_raw(1), &enc_logic(host.logic_ticks, &host.logic_state()), &mut evs);
+            match evs.pop() {
+                Some(NetEvent::Logic(t, st)) => client.apply_logic_state(t, &st),
+                _ => panic!("состояние логики не разобрано"),
+            }
+        };
+        let sync = |host: &World, client: &mut World, net: &mut Net| {
+            let st = StateMsg {
+                money: host.money,
+                level: host.level as u32,
+                delivered: host.delivered,
+                upgrades: host.upgrades,
+                income: 0.0,
+                time: host.time,
+                discovered: host.discovered.clone(),
+                extra: host.econ_save(),
+            };
+            let mut evs = Vec::new();
+            net.handle(SteamId::from_raw(1), &enc_state(&st), &mut evs);
+            net.handle(SteamId::from_raw(1), &enc_logic(host.logic_ticks, &host.logic_state()), &mut evs);
+            assert_eq!(evs.len(), 2, "оба сообщения разобраны");
+            for ev in evs {
+                match ev {
+                    NetEvent::State(s) => {
+                        client.apply_state(s.money, s.level as usize, s.delivered, s.upgrades, &s.discovered);
+                        client.sync_time(s.time);
+                        s.extra.lines().for_each(|l| {
+                            client.econ_line(l);
+                        });
+                    }
+                    NetEvent::Logic(t, st) => client.apply_logic_state(t, &st),
+                    _ => panic!("неожиданное событие"),
+                }
+            }
+        };
+        // Снимок мира несёт и память деталей: клиент входит с теми же таймером и счётчиком.
+        assert_eq!(client.logic_state(), host.logic_state());
+        let (mut drift, mut off_frames, mut pushes, mut since) = (0, 0, 0, 0);
+        for f in 0..5 * 60 * 60 {
+            frame(&mut host);
+            frame(&mut client);
+            since += 1;
+            if f % 20 == 19 {
+                drift += (client.logic_state() != host.logic_state()) as u32;
+                sync(&host, &mut client, &mut net);
+                host.logic_dirty = false;
+                since = 0;
+            } else if host.logic_dirty && since >= 6 {
+                push_logic(&host, &mut client, &mut net);
+                host.logic_dirty = false;
+                pushes += 1;
+                since = 0;
+            }
+            off_frames += (client.logic_state() != host.logic_state()) as u32;
+        }
+        assert!(host.total_sold > 300 && host.logic_ticks >= 19_000, "хост торговал и считал логику");
+        assert_eq!(client.money, host.money);
+        assert_eq!((client.level, client.delivered, client.rep, client.order.map(|o| o.1)), (host.level, host.delivered, host.rep, host.order.map(|o| o.1)));
+        assert_eq!(client.logic_state(), host.logic_state());
+        assert_eq!(client.logic_ticks, host.logic_ticks);
+        assert_eq!((client.great.clone(), client.discovered.clone()), (host.great.clone(), host.discovered.clone()));
+        for it in [Item::base(0), Item::base(1), Item::new(1, 2, 0)] {
+            let (a, b) = (client.market_factor(it), host.market_factor(it));
+            assert!((a - b).abs() < 1e-3, "цена рынка {}: {} и {}", it.name(), a, b);
+        }
+        assert!(host.market_factor(Item::base(1)) < 0.9, "рынок действительно насыщен");
+        // У копии мира свои предметы на лентах, поэтому показания датчиков она берёт у хоста,
+        // а всё остальное (таймеры, вентили, счётчики) досчитывает сама и не расходится.
+        println!(
+            "СЕТЬ: за 5 минут 900 сверок, расхождений логики до сверки: {}; кадров с расхождением {} из 18000; внеочередных рассылок {}",
+            drift, off_frames, pushes
+        );
+        assert!(drift <= 5 && off_frames <= 400, "логика клиента почти не отстаёт: {} и {}", drift, off_frames);
+    }
+
     #[test]
     fn codec_roundtrip() {
         let cmds = [
@@ -785,13 +995,19 @@ mod tests {
             Cmd::LevelUp(44, 36),
             Cmd::SetPorts(3, 4, 0b10_01_11_00),
             Cmd::FilterReset(7, 8),
+            Cmd::SetCfg(9, 10, 0x1F_FFFF_FFFF),
+            Cmd::LRemove(1, 2),
+            Cmd::LCfg(3, 4, 9999),
+            Cmd::Order(2),
+            Cmd::Skin(4),
+            Cmd::Prestige,
         ];
         for c in cmds {
             let bytes = enc_cmd(&c);
             let back = dec_cmd(&mut Rd(&bytes[1..])).expect("decodes");
             assert_eq!(format!("{:?}", c), format!("{:?}", back));
         }
-        let ops = [Op::Set(1, 2, Kind(31), Dir::E), Op::Clear(70, 71), Op::Dir(9, 9, Dir::N), Op::Level(8, 7, 4), Op::Ports(1, 1, 200), Op::FilterReset(2, 2)];
+        let ops = [Op::Set(1, 2, Kind(31), Dir::E), Op::Clear(70, 71), Op::Dir(9, 9, Dir::N), Op::Level(8, 7, 4), Op::Ports(1, 1, 200), Op::FilterReset(2, 2), Op::Cfg(3, 3, u64::MAX), Op::LClear(4, 4), Op::LCfg(5, 5, 77)];
         for o in ops {
             let bytes = enc_op(&o);
             let back = dec_op(&mut Rd(&bytes[1..])).expect("decodes");
@@ -833,6 +1049,13 @@ mod tests {
                 }
                 Op::FilterReset(x, y) => {
                     client.filter_reset(x, y);
+                }
+                Op::Cfg(x, y, v) => {
+                    client.set_cfg(x, y, v);
+                }
+                Op::LClear(x, y) => client.force_clear_logic(x, y),
+                Op::LCfg(x, y, v) => {
+                    client.set_lparam(x, y, v);
                 }
             }
         }

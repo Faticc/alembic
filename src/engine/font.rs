@@ -88,6 +88,11 @@ fn glyph(c: char) -> [u8; 7] {
     }
 }
 
+/// Умеет ли шрифт рисовать этот знак (иначе выходит пустая рамка).
+pub fn has_glyph(c: char) -> bool {
+    c == ' ' || glyph(c) != glyph('\u{1}')
+}
+
 pub fn text_w(s: &str, scale: i32) -> i32 {
     let n = s.chars().count() as i32;
     if n == 0 {

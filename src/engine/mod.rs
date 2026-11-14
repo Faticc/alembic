@@ -56,6 +56,8 @@ pub struct Input {
     pub alt: bool,
     pub wheel: f32,
     pub pressed: Vec<Key>,
+    /// Набранные за кадр знаки (с учётом раскладки) - для полей с текстом.
+    pub typed: Vec<char>,
     pub pan_x: f32,
     pub pan_y: f32,
 }

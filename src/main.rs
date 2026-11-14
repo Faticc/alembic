@@ -3,7 +3,7 @@
 //! Запуск: `cargo run --release`
 //! Доп. режимы: `--new` (новая игра), `--export-assets <png>` (атлас спрайтов),
 //! `--screenshot <png>` (кадр демо-фабрики без окна; `--tab N`, `--codex`, `--tool`),
-//! `--smoke` (короткий прогон окна).
+//! `--demo06 <png>` (кадр сцены обновления 0.6, см. demo06_shot), `--smoke` (короткий прогон окна).
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -62,7 +62,21 @@ fn open_window(fullscreen: bool) -> Window {
         window.set_position(0, 0);
     }
     window.set_target_fps(60);
+    window.set_input_callback(Box::new(CharSink));
     window
+}
+
+/// Знаки, набранные с клавиатуры с прошлого кадра: minifb отдаёт их через обратный вызов.
+static TYPED: std::sync::Mutex<Vec<char>> = std::sync::Mutex::new(Vec::new());
+
+struct CharSink;
+
+impl minifb::InputCallback for CharSink {
+    fn add_char(&mut self, uni_char: u32) {
+        if let (Some(c), Ok(mut buf)) = (char::from_u32(uni_char), TYPED.lock()) {
+            buf.push(c);
+        }
+    }
 }
 
 const TITLE: &str = "Alembic - алхимический тайкун";
@@ -180,6 +194,225 @@ fn demo_world() -> World {
     w
 }
 
+/// Показательная сцена обновления 0.6: все новые постройки в работе (для кадров самопроверки).
+fn demo06_world() -> World {
+    use world::{pack_ports, ratio_cfg, sorter_set, tele_cfg, Cond, Item, PORT_AUTO, PORT_IN, PORT_OFF};
+    use Dir::{E, N, S};
+    let mut w = World::new(1);
+    w.veins.iter_mut().for_each(|v| *v = 0);
+    w.money = 1e12;
+    w.level = world::FINAL_LEVEL;
+    for (x, y, e) in [(20, 12, 1u8), (27, 16, 1), (20, 21, 3), (20, 26, 1), (21, 25, 2)] {
+        w.veins[(y * world::W + x) as usize] = e;
+    }
+    fn put(w: &mut World, name: &str, x: i32, y: i32, d: Dir) {
+        w.place(Kind::by_name(name), x, y, d).expect("demo placement");
+    }
+    // Склад-источник: бесконечный запас предмета для показа.
+    fn src(w: &mut World, x: i32, y: i32, d: Dir, it: Item) {
+        put(w, "СКЛАД", x, y, d);
+        let b = w.tiles[(y * world::W + x) as usize].as_mut().unwrap();
+        b.slots[0] = Some(it);
+        b.count = 100_000;
+    }
+    let belt = "КОНВЕЙЕР";
+    let post = "ТОРГОВЫЙ ПОСТ";
+    // 1. Делитель с пропорцией 3:1.
+    put(&mut w, "ЭКСТРАКТОР", 20, 12, E);
+    put(&mut w, "ДЕЛИТЕЛЬ С ПРОПОРЦИЕЙ", 21, 12, E);
+    w.set_cfg(21, 12, ratio_cfg(3, 1));
+    for x in 22..25 {
+        put(&mut w, belt, x, 12, E);
+    }
+    put(&mut w, post, 25, 12, N);
+    put(&mut w, belt, 21, 13, S);
+    put(&mut w, "УТИЛИЗАТОР", 21, 14, N);
+    // 2. Дистиллятор со стороной отказа: огонь перегоняется, вода уходит вбок.
+    src(&mut w, 20, 16, E, Item::base(0));
+    src(&mut w, 21, 15, S, Item::base(1));
+    put(&mut w, "ДИСТИЛЛЯТОР", 21, 16, E);
+    w.set_cfg(21, 16, 2);
+    put(&mut w, belt, 22, 16, E);
+    put(&mut w, post, 23, 16, N);
+    put(&mut w, belt, 21, 17, S);
+    put(&mut w, "УТИЛИЗАТОР", 21, 18, N);
+    // 3. Алтарь с магистерием лавы III: скорость и двойной выход машинам вокруг.
+    src(&mut w, 28, 13, S, Item::new(5, 3, 25));
+    put(&mut w, "АЛТАРЬ", 28, 14, N);
+    put(&mut w, "ЭКСТРАКТОР", 27, 16, E);
+    put(&mut w, "КРИСТАЛЛИЗАТОР", 28, 16, E);
+    put(&mut w, belt, 29, 16, E);
+    put(&mut w, post, 30, 16, N);
+    // 4. Тигель: слиток огня + слиток воды = слиток пара. Трансмутатор: огонь -> земля.
+    src(&mut w, 33, 12, E, Item::new(1, 2, 4));
+    src(&mut w, 34, 11, S, Item::new(2, 2, 4));
+    put(&mut w, "ТИГЕЛЬ", 34, 12, E);
+    put(&mut w, belt, 35, 12, E);
+    put(&mut w, post, 36, 12, N);
+    src(&mut w, 33, 15, E, Item::base(0));
+    put(&mut w, "ТРАНСМУТАТОР", 34, 15, E);
+    put(&mut w, belt, 35, 15, E);
+    put(&mut w, post, 36, 15, N);
+    // 5. Атанор: четыре передатчика на одном коде шлют магистерии по очереди (ровно 1:1:1:1),
+    // приёмник выкладывает их на одну ленту. Лишнее уходит в сторону отказа, камень - телепортом в лавку.
+    for e in 0..4 {
+        src(&mut w, 30 + e, 18, S, Item::new(1 << e, 3, 25));
+        put(&mut w, "ТЕЛЕПОРТ-ПЕРЕДАТЧИК", 30 + e, 19, N);
+        w.set_cfg(30 + e, 19, tele_cfg(100));
+    }
+    put(&mut w, "ТЕЛЕПОРТ-ПРИЁМНИК", 31, 21, E);
+    w.set_cfg(31, 21, tele_cfg(100));
+    put(&mut w, belt, 32, 21, E);
+    put(&mut w, belt, 33, 21, E);
+    put(&mut w, "АТАНОР", 34, 21, E);
+    w.set_ports(34, 21, pack_ports([PORT_AUTO, PORT_OFF, PORT_IN, PORT_OFF]));
+    w.set_cfg(34, 21, 2);
+    put(&mut w, "УТИЛИЗАТОР", 34, 22, N);
+    put(&mut w, belt, 35, 21, E);
+    put(&mut w, "ТЕЛЕПОРТ-ПЕРЕДАТЧИК", 36, 21, N);
+    w.set_cfg(36, 21, tele_cfg(7));
+    put(&mut w, "ТЕЛЕПОРТ-ПРИЁМНИК", 38, 40, E);
+    w.set_cfg(38, 40, tele_cfg(7));
+    // 6. Упаковщик -> телепорт 0042 -> два приёмника по очереди: распаковщик и прямо в лавку.
+    put(&mut w, "ЭКСТРАКТОР", 20, 21, E);
+    w.force_level(20, 21, 5);
+    put(&mut w, "УПАКОВЩИК", 21, 21, E);
+    put(&mut w, belt, 22, 21, E);
+    put(&mut w, "ТЕЛЕПОРТ-ПЕРЕДАТЧИК", 23, 21, N);
+    w.set_cfg(23, 21, tele_cfg(42));
+    put(&mut w, "ТЕЛЕПОРТ-ПРИЁМНИК", 27, 22, E);
+    w.set_cfg(27, 22, tele_cfg(42));
+    put(&mut w, belt, 28, 22, E);
+    put(&mut w, "РАСПАКОВЩИК", 29, 22, E);
+    put(&mut w, belt, 30, 22, E);
+    put(&mut w, post, 31, 22, N);
+    put(&mut w, "ТЕЛЕПОРТ-ПРИЁМНИК", 38, 39, E);
+    w.set_cfg(38, 39, tele_cfg(42));
+    // 7. Сортировочный узел: огонь вперёд, вода вправо, остальное влево. За ним фильтр по чистоте.
+    put(&mut w, "ЭКСТРАКТОР", 20, 26, E);
+    put(&mut w, "ЭКСТРАКТОР", 21, 25, S);
+    for x in 21..24 {
+        put(&mut w, belt, x, 26, E);
+    }
+    put(&mut w, "СОРТИРОВОЧНЫЙ УЗЕЛ", 24, 26, E);
+    let fire = Cond { mask: 1, ..Cond::default() };
+    w.set_cfg(24, 26, sorter_set(sorter_set(0, 0, fire), 1, Cond { mask: 2, ..Cond::default() }));
+    put(&mut w, belt, 25, 26, E);
+    put(&mut w, "ФИЛЬТР", 26, 26, E);
+    w.set_cfg(26, 26, Cond { purity: 2, form: 1, ..Cond::default() }.bits());
+    put(&mut w, belt, 27, 26, E);
+    put(&mut w, post, 28, 26, N);
+    put(&mut w, belt, 26, 27, S);
+    put(&mut w, post, 26, 28, N);
+    put(&mut w, belt, 24, 27, S);
+    put(&mut w, post, 24, 28, N);
+    // 8. Логика: таймер открывает и закрывает ворота на ленте; датчик считает предметы,
+    // каждый пятый через счётчик включает защёлку, а та (через НЕ) держит машину остановленной.
+    put(&mut w, "ТАЙМЕР", 22, 10, S);
+    w.set_lparam(22, 10, 40);
+    put(&mut w, "ПРОВОД", 22, 11, N);
+    put(&mut w, "ИСПОЛНИТЕЛЬ", 22, 12, N);
+    put(&mut w, "ДАТЧИК ПРЕДМЕТА", 24, 12, N);
+    put(&mut w, "СЧЁТЧИК", 24, 11, N);
+    w.set_lparam(24, 11, 5);
+    put(&mut w, "ЗАЩЁЛКА", 24, 10, E);
+    for x in 25..29 {
+        put(&mut w, "ПРОВОД", x, 10, N);
+    }
+    for y in 11..16 {
+        put(&mut w, "ПРОВОД", 28, y, N);
+    }
+    put(&mut w, "ИСПОЛНИТЕЛЬ", 28, 16, N);
+    put(&mut w, "ДАТЧИК ЗАТОРА", 29, 16, E);
+    put(&mut w, "ВЕНТИЛЬ ИЛИ", 30, 15, N);
+    put(&mut w, "ВЕНТИЛЬ НЕ", 30, 14, N);
+    put(&mut w, "ВЕНТИЛЬ И", 30, 13, N);
+    w.rep = [4, 7, 1, 10];
+    w.money = 2.5e7;
+    w
+}
+
+/// Кадр сцены 0.6: `--cam X Y`, `--hover X Y` (тайл под курсором), `--panel X Y` (окно настройки),
+/// `--codex N` (каталог чистоты N), `--stats`, `--tab N`, `--tool ИМЯ`, `--secs N`, `--fps N`.
+fn demo06_shot(path: &str, args: &[String]) {
+    let nums = |flag: &str| -> Option<Vec<f32>> {
+        let i = args.iter().position(|a| a == flag)?;
+        Some(args[i + 1..].iter().take(2).map_while(|v| v.parse().ok()).collect())
+    };
+    let has = |flag: &str| args.iter().any(|a| a == flag);
+    let mut game = Game::new(demo06_world(), Audio::new(false), false);
+    game.persist = false;
+    let cam = nums("--cam").filter(|v| v.len() == 2).unwrap_or(vec![28.0, 16.0]);
+    game.cam_x = cam[0];
+    game.cam_y = cam[1];
+    game.tab = nums("--tab").map_or(5, |v| v[0] as usize);
+    let fps = nums("--fps").map_or(60, |v| v[0] as u32);
+    let secs = nums("--secs").map_or(90, |v| v[0] as u32);
+    let mut inp = Input { mx: 5, my: 5, ..Default::default() };
+    for _ in 0..secs * fps {
+        game.update(&inp, 1.0 / fps as f32, 1280, 720);
+    }
+    if let Some(h) = nums("--hover").filter(|v| v.len() == 2) {
+        inp.mx = 640 + ((h[0] + 0.5 - cam[0]) * 48.0) as i32;
+        inp.my = 360 + ((h[1] + 0.5 - cam[1]) * 48.0) as i32;
+    }
+    if let Some(name) = args.iter().position(|a| a == "--tool").and_then(|i| args.get(i + 1)) {
+        game.tool = Some(Kind::by_name(name));
+    }
+    if let Some(p) = nums("--panel").filter(|v| v.len() == 2) {
+        game.show_cfg = Some((p[0] as i32, p[1] as i32));
+        game.cfg_tab = nums("--slot").map_or(0, |v| v[0] as usize);
+    }
+    if let Some(p) = nums("--codex") {
+        game.show_codex = true;
+        game.codex_p = p.first().map_or(1, |v| *v as u8);
+    }
+    game.show_stats = has("--stats");
+    game.show_wires = has("--wires");
+    game.show_guild = has("--guild");
+    game.show_great = has("--great");
+    if has("--library") {
+        // Для кадра библиотеки: два чертежа из показательной фабрики (второй - со схемой логики).
+        game.world.money = 1e9;
+        for (name, sel) in [("ЛИНИЯ СОРТИРОВКИ", (24, 26, 28, 28)), ("ВОРОТА ПО ТАЙМЕРУ", (22, 10, 30, 16))] {
+            game.sel = Some(sel);
+            game.copy_selection(false);
+            inp.typed = name.chars().collect();
+            game.show_bp = true;
+            game.update(&inp, 1.0 / fps as f32, 1280, 720);
+            game.bp_save();
+        }
+        inp.typed = "МОЯ ФАБРИКА".chars().collect();
+        game.pasting = false;
+        inp.mx = 500;
+        inp.my = 250;
+    }
+    if has("--great") {
+        // Для кадра витража: часть каталога уже сдана (первые формы целиком и россыпь дальше).
+        for id in 0..world::N_ITEM_IDS {
+            if id < 300 || id % 7 == 0 || id % 11 == 3 {
+                game.world.great[id] = true;
+            }
+        }
+    }
+    if has("--guild") {
+        let _ = game.world.take_order(0);
+        game.world.set_skin(2);
+    }
+    game.fps = fps as f32;
+    game.frame_ms = 1000.0 / fps as f32;
+    game.update(&inp, 1.0 / fps as f32, 1280, 720);
+    let mut canvas = Image::new(1280, 720);
+    game.draw(&mut canvas);
+    engine::png::save_png(path, &canvas, true).expect("save screenshot");
+    let w = &game.world;
+    let stones = (1..=3u8).filter(|p| w.discovered[world::Item::new(15, *p, world::FORM_STONE).id()]).count();
+    println!(
+        "{} к/с, {} с: продано {} шт, каталог {}/{}, камней в каталоге {}, деньги {:.0}",
+        fps, secs, w.total_sold, w.catalog_found(), world::N_ITEM_IDS, stones, w.money
+    );
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let arg_after = |flag: &str| args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned();
@@ -188,6 +421,11 @@ fn main() {
     if let Some(path) = arg_after("--export-assets") {
         let atlas = assets::Assets::generate().atlas();
         engine::png::save_png(&path, &atlas, false).expect("save atlas");
+        return;
+    }
+
+    if let Some(path) = arg_after("--demo06") {
+        demo06_shot(&path, &args);
         return;
     }
 
@@ -261,9 +499,9 @@ fn main() {
         let mut canvas = Image::new(1280, 720);
         game.draw(&mut canvas);
         engine::png::save_png(&path, &canvas, true).expect("save screenshot");
-        let found: Vec<String> = (0..world::N_KINDS)
+        let found: Vec<String> = (0..world::N_ALL_IDS)
             .filter(|i| game.world.discovered[*i])
-            .map(|i| world::Item::new((i % 15) as u8 + 1, 1, (i / 15) as u8).name())
+            .map(|i| world::Item::from_id(i).name())
             .collect();
         println!("sold={} earned={:.0} found={:?}", game.world.total_sold, game.world.money - money0, found);
         return;
@@ -356,9 +594,12 @@ fn main() {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(42);
-    let world = loaded.unwrap_or_else(|| World::new(seed));
+    let world = loaded.unwrap_or_else(|| World::new_game(seed));
     let mut game = Game::new(world, Audio::new(!smoke), fresh);
     game.persist = !smoke;
+    if !smoke {
+        game.open_library(game::BP_FILE);
+    }
     let updater = if smoke || has("--no-update") { None } else { update::start() };
 
     let (mut fullscreen, show_fps) = load_settings();
@@ -430,6 +671,7 @@ fn main() {
             alt: down(Key::LeftAlt, Key::RightAlt),
             wheel: window.get_scroll_wheel().map_or(0.0, |s| s.1),
             pressed: window.get_keys_pressed(KeyRepeat::No),
+            typed: TYPED.lock().map(|mut b| std::mem::take(&mut *b)).unwrap_or_default(),
             pan_x: axis(down(Key::A, Key::Left), down(Key::D, Key::Right)),
             pan_y: axis(down(Key::W, Key::Up), down(Key::S, Key::Down)),
         };

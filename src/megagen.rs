@@ -449,11 +449,11 @@ fn kind_name(i: usize) -> String {
 }
 
 fn found(w: &World) -> usize {
-    w.discovered.iter().filter(|d| **d).count()
+    (0..N_KINDS).filter(|i| w.kind_known(*i)).count()
 }
 
 fn missing(w: &World) -> Vec<String> {
-    (0..N_KINDS).filter(|i| !w.discovered[*i]).map(kind_name).collect()
+    (0..N_KINDS).filter(|i| !w.kind_known(*i)).map(kind_name).collect()
 }
 
 /// Прогоняет `secs` игровых секунд кадрами по 1/fps; возвращает секунду, на которой каталог
@@ -552,13 +552,13 @@ pub fn stats(path: &str) {
         for s in 0..60 {
             run(&mut w, 1);
             for i in 0..N_KINDS {
-                if !w.discovered[i] {
+                if !w.kind_known(i) {
                     slowest[i] = slowest[i].max(s + 1);
                 }
             }
         }
         for i in 0..N_KINDS {
-            hits[i] += w.discovered[i] as u32;
+            hits[i] += w.kind_known(i) as u32;
         }
     }
     let mut order: Vec<usize> = (0..N_KINDS).collect();

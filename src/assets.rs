@@ -2,7 +2,7 @@
 //! Базовый спрайт смотрит на север (выход вверху), остальные направления - поворотом.
 
 use crate::engine::*;
-use crate::world::{Role, KINDS, N_FORMS};
+use crate::world::{Item, Lk, Role, FORM_STONE, KINDS, N_FORMS_ALL};
 
 pub const TILE: i32 = 24;
 pub const ITEM: i32 = 10;
@@ -34,6 +34,10 @@ pub struct Assets {
     pub kinds: Vec<Vec<Image>>,
     /// Индекс: Item::id().
     pub items: Vec<Image>,
+    /// Деревянная обвязка ящика: рисуется поверх предмета, который в нём лежит.
+    pub crate_frame: Image,
+    /// Преграда на карте (два варианта).
+    pub rocks: Vec<Image>,
 }
 
 impl Assets {
@@ -50,7 +54,7 @@ impl Assets {
         let belt_l = [0, 1].map(|s| (0..8).map(|f| belt_curve(f, s)).collect::<Vec<_>>());
         let belt_r = [0, 1].map(|s| belt_l[s].iter().map(|i| i.mirrored_h()).collect::<Vec<_>>());
         let mut items = Vec::new();
-        for form in 0..N_FORMS as u8 {
+        for form in 0..N_FORMS_ALL as u8 {
             for purity in 1..=3u8 {
                 for mask in 1..=15u8 {
                     items.push(item_sprite(mask, purity, form));
@@ -69,6 +73,18 @@ impl Assets {
                     Role::Splitter => vec![splitter(body, false)],
                     Role::Overflow | Role::Switch => vec![splitter(body, true)],
                     Role::Filter => vec![filter(body)],
+                    Role::Ratio => vec![ratio(body)],
+                    Role::Altar => (0..4).map(|fr| altar(body, fr)).collect(),
+                    Role::Crucible => (0..4).map(|fr| crucible(body, fr)).collect(),
+                    Role::Transmuter => (0..4).map(|fr| transmuter(body, fr)).collect(),
+                    Role::Opus => (0..4).map(|fr| production(body, FORM_STONE, fr)).collect(),
+                    Role::Packer => (0..4).map(|fr| packer(body, false, fr)).collect(),
+                    Role::Unpacker => (0..4).map(|fr| packer(body, true, fr)).collect(),
+                    Role::TeleIn => (0..4).map(|fr| teleport(body, false, fr)).collect(),
+                    Role::TeleOut => (0..4).map(|fr| teleport(body, true, fr)).collect(),
+                    Role::Sorter => vec![sorter(body)],
+                    Role::GuildPost => vec![trade(body)],
+                    Role::Logic(lk) => vec![logic_part(lk, body, false), logic_part(lk, body, true)],
                     Role::Bridge => vec![bridge()],
                     Role::Tunnel => vec![tunnel(body, false), tunnel(body, true)],
                     Role::Storage => vec![storage(body)],
@@ -92,6 +108,16 @@ impl Assets {
             belt_cap: belt_cap(),
             kinds,
             items,
+            crate_frame: crate_frame(),
+            rocks: (0..2).map(rock).collect(),
+        }
+    }
+
+    /// Рисует предмет; ящик - тот же предмет в деревянной обвязке.
+    pub fn draw_item(&self, c: &mut Image, it: Item, x: i32, y: i32, scale: i32) {
+        c.blit(&self.items[it.id().min(self.items.len() - 1)], x, y, scale);
+        if it.boxed {
+            c.blit(&self.crate_frame, x, y, scale);
         }
     }
 
@@ -109,7 +135,8 @@ impl Assets {
             all.extend(k.iter());
         }
         all.extend(self.items.iter());
-        let mut a = Image::new(548, 1100);
+        all.push(&self.crate_frame);
+        let mut a = Image::new(548, 1300);
         a.clear(hex(0x3A3346));
         let (mut x, mut y, mut row_h) = (2, 2, 0);
         for im in all {
@@ -337,6 +364,18 @@ fn splitter(body: Color, overflow: bool) -> Image {
     im
 }
 
+/// Делитель с пропорцией: выходы вперёд и вправо, на корпусе - весы из двух столбиков.
+fn ratio(body: Color) -> Image {
+    let mut im = machine_base(body, false, true);
+    im.fill_rect(20, 8, 4, 8, OUTLINE);
+    im.fill_rect(21, 9, 3, 6, NOZZLE);
+    im.fill_rect(0, 8, 3, 8, OUTLINE);
+    im.fill_rect(0, 9, 3, 6, PORT);
+    im.fill_round_rect(5, 5, 14, 14, 3.0, OUTLINE);
+    im.fill_round_rect(6, 6, 12, 12, 2.0, hex(0x3A3346));
+    im
+}
+
 fn filter(body: Color) -> Image {
     let mut im = splitter(body, false);
     // Вместо стрелок - табличка, на которой игра рисует образец.
@@ -381,6 +420,214 @@ fn trade(body: Color) -> Image {
     im.fill_rect(10, 9, 4, 1, hex(0x8A6A1A));
     im.fill_rect(10, 12, 4, 1, hex(0x8A6A1A));
     im.fill_rect(10, 14, 4, 1, hex(0x8A6A1A));
+    im
+}
+
+/// Алтарь: каменная плита с чашей, в которой горит изделие (его рисует игра поверх).
+fn altar(body: Color, f: i32) -> Image {
+    let mut im = sink_base(body);
+    im.fill_circle(12.0, 12.0, 8.2, OUTLINE);
+    im.fill_circle(12.0, 12.0, 7.2, GOLD);
+    im.fill_circle(12.0, 12.0, 6.0, hex(0x241C2C));
+    // Четыре огонька стихий по кругу; при работе они бегут.
+    for (k, col) in ELEM_COLORS.iter().enumerate() {
+        let a = (k as f32 * 90.0 + f as f32 * 22.5).to_radians();
+        im.fill_circle(12.0 + a.cos() * 7.2, 12.0 + a.sin() * 7.2, 1.3, *col);
+    }
+    im
+}
+
+/// Тигель: чаша, в которой две половины разного цвета сливаются в одну.
+fn crucible(body: Color, f: i32) -> Image {
+    let mut im = machine_base(body, true, true);
+    im.fill_circle(12.0, 12.0, 6.8, OUTLINE);
+    im.fill_circle(12.0, 12.0, 5.8, hex(0x241C2C));
+    let a = (f as f32 * 45.0).to_radians();
+    let (dx, dy) = (a.cos() * 2.2, a.sin() * 2.2);
+    im.fill_circle(12.0 - dx, 12.0 - dy, 2.9, ELEM_COLORS[0]);
+    im.fill_circle(12.0 + dx, 12.0 + dy, 2.9, ELEM_COLORS[1]);
+    im.fill_circle(12.0, 12.0, 1.6, hex(0xFFF6DC));
+    im
+}
+
+/// Трансмутатор: круг четырёх стихий, по которому бежит светлая метка.
+fn transmuter(body: Color, f: i32) -> Image {
+    let mut im = machine_base(body, true, true);
+    im.fill_circle(12.0, 12.0, 6.8, OUTLINE);
+    im.fill_circle(12.0, 12.0, 5.8, hex(0xEFE6D0));
+    // Порядок круга: огонь, земля, вода, эфир.
+    for (k, e) in [0usize, 2, 1, 3].iter().enumerate() {
+        let a = (k as f32 * 90.0 - 90.0).to_radians();
+        im.fill_circle(12.0 + a.cos() * 3.6, 12.0 + a.sin() * 3.6, 1.7, ELEM_COLORS[*e]);
+    }
+    let a = (f as f32 * 90.0 - 45.0).to_radians();
+    im.fill_circle(12.0 + a.cos() * 3.6, 12.0 + a.sin() * 3.6, 0.8, OUTLINE);
+    im
+}
+
+/// Обвязка ящика 10x10: рамка из досок с тёмными углами, середина прозрачная.
+fn crate_frame() -> Image {
+    let wood = hex(0x9B6B43);
+    let mut im = Image::new(ITEM, ITEM);
+    for i in 0..ITEM {
+        for (x, y) in [(i, 0), (i, ITEM - 1), (0, i), (ITEM - 1, i)] {
+            im.set(x, y, wood);
+        }
+    }
+    for i in 1..ITEM - 1 {
+        im.set(i, 1, shade(wood, 1.3));
+        im.set(1, i, shade(wood, 1.3));
+        im.set(i, ITEM - 2, shade(wood, 0.7));
+        im.set(ITEM - 2, i, shade(wood, 0.7));
+    }
+    for (x, y) in [(0, 0), (ITEM - 1, 0), (0, ITEM - 1), (ITEM - 1, ITEM - 1)] {
+        im.set(x, y, OUTLINE);
+    }
+    im
+}
+
+/// Упаковщик и распаковщик: ящик на табличке; у распаковщика крышка снята.
+fn packer(body: Color, open: bool, f: i32) -> Image {
+    let wood = hex(0xB5894A);
+    let mut im = machine_base(body, true, true);
+    im.fill_round_rect(5, 5, 14, 14, 3.0, OUTLINE);
+    im.fill_round_rect(6, 6, 12, 12, 2.0, hex(0x3A3346));
+    im.fill_rect(8, 9, 8, 7, OUTLINE);
+    im.fill_rect(9, 10, 6, 5, wood);
+    im.fill_rect(9, 12, 6, 1, shade(wood, 0.7));
+    if open {
+        // Открытый ящик: видно содержимое, крышка сдвинута.
+        im.fill_rect(9, 10, 6, 2, hex(0x241C2C));
+        im.fill_rect(10, 10, 1, 1, ELEM_COLORS[0]);
+        im.fill_rect(12, 10, 1, 1, ELEM_COLORS[1]);
+        im.fill_rect(14, 10, 1, 1, ELEM_COLORS[2]);
+        im.fill_rect(7, 7, 6, 1, wood);
+    } else {
+        im.fill_rect(8, 8, 8, 2, OUTLINE);
+        im.fill_rect(9, 8, 6, 1, shade(wood, 1.3));
+        im.fill_rect(11, 9, 2, 6, shade(wood, 0.6));
+    }
+    let lamp = [(4, 4), (19, 4), (19, 19), (4, 19)][f as usize % 4];
+    im.set(lamp.0, lamp.1, hex(0xFFF6DC));
+    im
+}
+
+/// Телепорт: передатчик принимает со всех сторон, приёмник выдаёт вперёд; в середине - портал.
+fn teleport(body: Color, receiver: bool, f: i32) -> Image {
+    let mut im = if receiver { machine_base(body, false, false) } else { sink_base(body) };
+    let glow = if receiver { hex(0x58D4F0) } else { hex(0xC860E8) };
+    im.fill_circle(12.0, 12.0, 7.4, OUTLINE);
+    im.fill_circle(12.0, 12.0, 6.4, hex(0x14121A));
+    // Кольца портала сходятся к центру у передатчика и расходятся у приёмника.
+    let ph = if receiver { f } else { 3 - f };
+    for k in 0..3 {
+        let r = 1.2 + ((k * 2 + ph) % 6) as f32;
+        for a in 0..24 {
+            let t = (a as f32 * 15.0).to_radians();
+            im.set((12.0 + t.cos() * r) as i32, (12.0 + t.sin() * r) as i32, shade(glow, 0.6 + 0.2 * k as f32));
+        }
+    }
+    im.fill_circle(12.0, 12.0, 1.4, hex(0xFFF6DC));
+    im
+}
+
+/// Сортировочный узел: три выхода (вперёд, вправо, влево), у каждого своя цветная метка.
+fn sorter(body: Color) -> Image {
+    let mut im = splitter(body, false);
+    im.fill_round_rect(5, 5, 14, 14, 3.0, OUTLINE);
+    im.fill_round_rect(6, 6, 12, 12, 2.0, hex(0x3A3346));
+    im.fill_rect(11, 9, 2, 8, NOZZLE);
+    im.fill_rect(8, 11, 8, 2, NOZZLE);
+    im.fill_circle(12.0, 8.5, 1.6, ELEM_COLORS[0]);
+    im.fill_circle(15.5, 12.0, 1.6, ELEM_COLORS[1]);
+    im.fill_circle(8.5, 12.0, 1.6, ELEM_COLORS[2]);
+    im
+}
+
+/// Деталь слоя сигналов: маленькая плашка поверх постройки, выход - вверх (на север).
+/// Второй кадр - деталь с включённым выходом.
+fn logic_part(lk: Lk, body: Color, on: bool) -> Image {
+    let mut im = Image::new(TILE, TILE);
+    let lit = if on { hex(0xFFE25A) } else { hex(0x6A5A2A) };
+    if lk == Lk::Wire {
+        im.fill_rect(10, 10, 4, 4, OUTLINE);
+        im.fill_rect(11, 11, 2, 2, lit);
+        return im;
+    }
+    im.fill_round_rect(5, 5, 14, 14, 3.0, OUTLINE);
+    im.fill_round_rect(6, 6, 12, 12, 2.0, body);
+    if lk != Lk::Act {
+        // Выходной контакт сверху.
+        im.fill_rect(10, 2, 4, 4, OUTLINE);
+        im.fill_rect(11, 2, 2, 3, lit);
+    }
+    let ink = hex(0xFFF6DC);
+    match lk {
+        Lk::And => {
+            im.fill_rect(9, 9, 2, 7, ink);
+            im.fill_rect(13, 9, 2, 7, ink);
+            im.fill_rect(9, 8, 6, 2, ink);
+        }
+        Lk::Or => {
+            im.fill_rect(8, 13, 2, 3, ink);
+            im.fill_rect(14, 13, 2, 3, ink);
+            im.fill_rect(10, 10, 4, 3, ink);
+            im.fill_rect(11, 8, 2, 2, ink);
+        }
+        Lk::Not => {
+            im.fill_rect(8, 11, 8, 2, ink);
+            im.fill_circle(12.0, 8.5, 1.5, ink);
+        }
+        Lk::Latch => {
+            im.fill_rect(9, 8, 2, 8, ink);
+            im.fill_rect(9, 14, 6, 2, ink);
+        }
+        Lk::Counter => {
+            for k in 0..3 {
+                im.fill_rect(8 + k * 3, 9, 2, 7, ink);
+            }
+        }
+        Lk::Timer => {
+            im.fill_circle(12.0, 12.0, 4.5, ink);
+            im.fill_circle(12.0, 12.0, 3.3, body);
+            im.fill_rect(12, 9, 1, 4, ink);
+            im.fill_rect(12, 12, 3, 1, ink);
+        }
+        Lk::SenJam => {
+            im.fill_rect(8, 9, 8, 2, ink);
+            im.fill_rect(8, 13, 8, 2, ink);
+        }
+        Lk::SenStore => {
+            im.fill_rect(8, 8, 8, 8, ink);
+            im.fill_rect(9, 9, 6, 3, body);
+        }
+        Lk::SenItem => {
+            im.fill_circle(12.0, 12.0, 3.6, ink);
+            im.fill_circle(12.0, 12.0, 1.6, OUTLINE);
+        }
+        Lk::Act => {
+            im.fill_rect(11, 7, 2, 10, ink);
+            im.fill_rect(7, 11, 10, 2, ink);
+            im.fill_circle(12.0, 12.0, 2.2, lit);
+        }
+        Lk::Wire => {}
+    }
+    im
+}
+
+/// Преграда: груда камней, которую надо обойти или снести.
+fn rock(variant: i32) -> Image {
+    let mut im = Image::new(TILE, TILE);
+    let stone = hex(0x7A7486);
+    let spots: [(f32, f32, f32); 4] =
+        if variant == 0 { [(8.0, 9.0, 6.0), (16.0, 8.0, 5.0), (13.0, 16.0, 6.5), (6.0, 17.0, 4.0)] } else { [(7.0, 14.0, 6.0), (15.0, 15.0, 6.0), (12.0, 7.0, 5.5), (18.0, 8.0, 3.5)] };
+    for (x, y, r) in spots {
+        im.fill_circle(x, y, r + 1.0, OUTLINE);
+    }
+    for (x, y, r) in spots {
+        im.fill_circle(x, y, r, stone);
+        im.fill_circle(x - 1.0, y - 1.0, r * 0.55, shade(stone, 1.25));
+    }
     im
 }
 
@@ -469,7 +716,7 @@ fn hub() -> Image {
 
 /// Силуэты форм 2..25: o - контур (цвет чистоты), # - цвет смеси, + - блик,
 /// g - золото, w - белый, k - дерево.
-const SHAPES: [[&str; 10]; 24] = [
+const SHAPES: [[&str; 10]; 25] = [
     // 2 зелье
     [
         "...oooo...", "...okko...", "...o##o...", "..o####o..", ".o######o.", ".o+#####o.", ".o######o.",
@@ -589,6 +836,11 @@ const SHAPES: [[&str; 10]; 24] = [
     [
         "....gg....", ".g..gg..g.", "..gg##gg..", "..g#++#g..", "gg#+ww+#gg", "gg#+ww+#gg", "..g#++#g..",
         "..gg##gg..", ".g..gg..g.", "....gg....",
+    ],
+    // 26 философский камень
+    [
+        "..oooooo..", ".o######o.", "o##+gg+##o", "o#+gwwg+#o", "o#ggwwgg#o", "o#ggwwgg#o", "o#+gwwg+#o",
+        "o##+gg+##o", ".o######o.", "..oooooo..",
     ],
 ];
 
