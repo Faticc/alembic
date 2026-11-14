@@ -1,0 +1,17 @@
+[workspace]
+
+[package]
+name = "vsbm"
+version = "1.0.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+android-activity = { version = "0.6", features = ["native-activity"] }
+
+[profile.release]
+opt-level = 2
+strip = true
+panic = "abort"
