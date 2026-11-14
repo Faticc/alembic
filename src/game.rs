@@ -2511,17 +2511,21 @@ let rate = format!("КРОЛИЧЬЯ НОРА: ВСЁ, ЧТО ВОШЛО В ПЕ
                         let right = w.feeds_from(x, y, b.dir.cw());
                         let curve_l = !back && left && !right;
                         let curve_r = !back && right && !left;
+                        // В ленту входят с обоих боков, сзади пусто: хвост за стыком не рисуется.
+                        let tee = !back && left && right;
                         let img = if curve_l {
                             &a.belt_l[style][fr]
                         } else if curve_r {
                             &a.belt_r[style][fr]
+                        } else if tee {
+                            &a.belt_t[style][fr]
                         } else {
                             &a.belt[style][fr]
                         };
                         let rot = b.dir as u8;
                         c.blit_ex(img, sx, sy, z, rot, 255);
                         // Скин гильдии: цветные борта на прямых участках.
-                        if w.skin > 0 && !curve_l && !curve_r {
+                        if w.skin > 0 && !curve_l && !curve_r && !tee {
                             let col = ELEM_COLORS[(w.skin as usize - 1) % 4];
                             if b.dir.dx() == 0 {
                                 c.fill_rect(sx + 3 * z, sy, z, ts, col);
@@ -2538,7 +2542,7 @@ let rate = format!("КРОЛИЧЬЯ НОРА: ВСЁ, ЧТО ВОШЛО В ПЕ
                         if right && !curve_r {
                             c.blit_ex(&a.belt_stub_r, sx, sy, z, rot, 255);
                         }
-                        if !back && !curve_l && !curve_r {
+                        if !back && !curve_l && !curve_r && !tee {
                             c.blit_ex(&a.belt_cap, sx, sy, z, rot, 255);
                         }
                         if !w.accepts_from(x + b.dir.dx(), y + b.dir.dy(), b.dir) {
@@ -2598,33 +2602,52 @@ let rate = format!("КРОЛИЧЬЯ НОРА: ВСЁ, ЧТО ВОШЛО В ПЕ
                 };
                 let (sx, sy) = (ox + x * ts, oy + y * ts);
                 let frame = if b.working { anim + (x * 3 + y * 5) as usize } else { 0 };
-                c.blit_ex(self.sprite(b.kind, frame), sx, sy, z, b.dir as u8, 255);
-                // Золотые метки уровня машины.
-                for i in 0..(b.level as i32 - 1) {
-                    c.fill_rect(sx + (1 + i * 4) * z, sy + 19 * z, 4 * z, 4 * z, OUTLINE);
-                    c.fill_rect(sx + (2 + i * 4) * z, sy + 20 * z, 2 * z, 2 * z, GOLD);
+                // У машин с настраиваемыми сторонами корпус рисуется без патрубков: стороны
+                // ложатся поверх по настоящей настройке, а не по рисунку.
+                let ported = port_modes(b.kind) > 0;
+                if ported {
+                    let f = &a.bare[b.kind.0 as usize];
+                    c.blit_ex(&f[frame % f.len()], sx, sy, z, b.dir as u8, 255);
+                } else {
+                    c.blit_ex(self.sprite(b.kind, frame), sx, sy, z, b.dir as u8, 255);
                 }
-                // Метки сторон: у перенастроенных машин всегда, у машины под курсором - для подсказки.
+                // Уровень машины виден по отделке корпуса: бронза, серебро, золото, золото с камнями.
+                if b.level >= 2 {
+                    let f = &a.trim[(b.level as usize - 2).min(a.trim.len() - 1)];
+                    c.blit(&f[(anim / 3) % f.len()], sx, sy, z);
+                }
+                // Стороны: выход - светлый патрубок с оранжевой меткой, вход - тёмное гнездо с
+                // зелёной, сторона отказа - фиолетовая, закрытая сторона - гладкий корпус.
+                // У машины под курсором стороны залиты цветом целиком, закрытые - тёмно-красным.
                 let hovered = hover == Some((x, y));
-                if port_modes(b.kind) > 0 && (hovered || b.ports != [PORT_AUTO; 4]) {
+                if ported {
                     for rel in 0..4 {
-                        let col = if reject_rel(b) == Some(rel) {
-                            hex(0xC860E8)
-                        } else if side_out(b, rel) {
-                            hex(0xFFB03A)
-                        } else if side_in(b, rel) {
-                            hex(0x7ED67A)
-                        } else {
-                            hex(0x8A2A2A)
-                        };
                         let (rx, ry, rw, rh) = match Dir::from_u8(b.dir as u8 + rel as u8) {
                             Dir::N => (8, 0, 8, 4),
                             Dir::S => (8, 20, 8, 4),
                             Dir::W => (0, 8, 4, 8),
                             Dir::E => (20, 8, 4, 8),
                         };
+                        let reject = reject_rel(b) == Some(rel);
+                        let (base, mark) = if reject {
+                            (hex(0xC860E8), hex(0xC860E8))
+                        } else if side_out(b, rel) {
+                            (hex(0xD8DCE6), hex(0xFFB03A))
+                        } else if side_in(b, rel) {
+                            (hex(0x14121A), hex(0x7ED67A))
+                        } else if hovered {
+                            (hex(0x8A2A2A), hex(0x8A2A2A))
+                        } else {
+                            continue;
+                        };
                         c.fill_rect(sx + rx * z, sy + ry * z, rw * z, rh * z, OUTLINE);
-                        c.fill_rect(sx + (rx + 1) * z, sy + (ry + 1) * z, (rw - 2) * z, (rh - 2) * z, col);
+                        let (ix, iy, iw, ih) = (rx + 1, ry + 1, rw - 2, rh - 2);
+                        c.fill_rect(sx + ix * z, sy + iy * z, iw * z, ih * z, if hovered { mark } else { base });
+                        if !hovered {
+                            // Цветная метка посередине патрубка.
+                            let (mx, my) = (ix + iw / 2 - 1, iy + ih / 2 - 1);
+                            c.fill_rect(sx + mx * z, sy + my * z, 2 * z, 2 * z, mark);
+                        }
                     }
                 }
                 let (cx, cy) = (sx + ts / 2, sy + ts / 2);

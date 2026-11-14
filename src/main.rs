@@ -400,6 +400,36 @@ fn demo06_shot(path: &str, args: &[String]) {
     game.show_wires = has("--wires");
     game.show_guild = has("--guild");
     game.show_great = has("--great");
+    if has("--levels") {
+        // Для кадра отделки: ряд машин уровней 1-5, машина с перенастроенными сторонами,
+        // добыча с выходом вбок и Т-образный стык лент.
+        use world::{pack_ports, PORT_AUTO, PORT_IN, PORT_OFF, PORT_OUT};
+        let w = &mut game.world;
+        let k = Kind::by_name;
+        for (i, name) in ["КРИСТАЛЛИЗАТОР", "СМЕСИТЕЛЬ", "ДИСТИЛЛЯТОР"].iter().enumerate() {
+            for l in 1..=5 {
+                let (x, y) = (56 + l * 2, 50 + i as i32 * 2);
+                w.place(k(name), x, y, Dir::E).expect("demo placement");
+                w.force_level(x, y, l as u8);
+            }
+        }
+        w.place(k("КРИСТАЛЛИЗАТОР"), 58, 56, Dir::N).expect("demo placement");
+        w.set_ports(58, 56, pack_ports([PORT_OFF, PORT_OUT, PORT_IN, PORT_AUTO]));
+        w.veins[(56 * world::W + 60) as usize] = 1;
+        w.veins[(56 * world::W + 62) as usize] = 2;
+        w.place(Kind(1), 60, 56, Dir::E).expect("demo placement");
+        w.place(Kind(1), 62, 56, Dir::E).expect("demo placement");
+        w.set_ports(62, 56, pack_ports([PORT_OFF, PORT_OUT, PORT_AUTO, PORT_AUTO]));
+        w.force_level(62, 56, 4);
+        w.place(k("СКЛАД"), 64, 56, Dir::E).expect("demo placement");
+        w.place(k("ДЕЛИТЕЛЬ"), 66, 56, Dir::E).expect("demo placement");
+        for (x, d) in [(57, Dir::E), (58, Dir::E), (60, Dir::W), (61, Dir::W)] {
+            w.place(Kind(0), x, 59, d).expect("demo placement");
+        }
+        w.place(Kind(0), 59, 59, Dir::N).expect("demo placement");
+        w.place(Kind(0), 59, 58, Dir::N).expect("demo placement");
+        game.zoom = 3;
+    }
     // `--layer 1` - кадр подземелья (камера задаётся в координатах слоя, как на поверхности).
     game.layer = nums("--layer").map_or(0, |v| v[0] as i32).clamp(0, 1);
     if has("--library") {

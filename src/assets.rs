@@ -30,8 +30,16 @@ pub struct Assets {
     pub belt_stub_l: Image,
     pub belt_stub_r: Image,
     pub belt_cap: Image,
+    /// Лента, в которую входят с обоих боков, а сзади ничего нет (Т-образный стык): без хвоста.
+    pub belt_t: [Vec<Image>; 2],
     /// Кадры спрайта каждой постройки, индекс - Kind.0.
     pub kinds: Vec<Vec<Image>>,
+    /// Те же кадры без нарисованных патрубков - для машин с настраиваемыми сторонами: их
+    /// стороны рисуются на карте по настоящей настройке. У остальных построек список пуст.
+    pub bare: Vec<Vec<Image>>,
+    /// Отделка корпуса по уровню машины: [уровень - 2] -> кадры (бронза, серебро, золото,
+    /// золото с мерцающими камнями).
+    pub trim: Vec<Vec<Image>>,
     /// Индекс: Item::id().
     pub items: Vec<Image>,
     /// Деревянная обвязка ящика: рисуется поверх предмета, который в нём лежит.
@@ -61,7 +69,7 @@ impl Assets {
                 }
             }
         }
-        let kinds = KINDS
+        let kinds: Vec<Vec<Image>> = KINDS
             .iter()
             .map(|d| {
                 let body = hex(d.color);
@@ -98,7 +106,16 @@ impl Assets {
                 }
             })
             .collect();
+        let bare = kinds
+            .iter()
+            .enumerate()
+            .map(|(i, frames)| if crate::world::port_modes(crate::world::Kind(i as u8)) > 0 { frames.iter().map(bare_body).collect() } else { Vec::new() })
+            .collect();
+        let belt_t = [0, 1].map(|s| belt[s].iter().map(belt_tee).collect::<Vec<_>>());
         Assets {
+            bare,
+            trim: (2..=5).map(|l| (0..if l == 5 { 4 } else { 1 }).map(|f| level_trim(l, f)).collect()).collect(),
+            belt_t,
             ground,
             veins,
             belt,
@@ -234,6 +251,88 @@ fn belt_stub() -> Image {
     for y in 3..21 {
         for x in 0..4 {
             im.set(x, y, if y == 3 || y == 20 { BELT_RAIL } else { BELT });
+        }
+    }
+    im
+}
+
+/// Т-образный стык: прямая лента на север без хвоста ниже боковых примыканий.
+fn belt_tee(straight: &Image) -> Image {
+    let mut im = straight.clone();
+    for x in 0..TILE {
+        for y in 21..TILE {
+            im.set(x, y, 0);
+        }
+    }
+    im.fill_rect(3, 20, 18, 1, BELT_RAIL);
+    im
+}
+
+/// Спрайт машины без нарисованных патрубков: всё, что выступает за корпус, стёрто, а кромка
+/// корпуса на месте патрубков восстановлена по соседним пикселям.
+fn bare_body(src: &Image) -> Image {
+    let mut im = src.clone();
+    let get = |im: &Image, x: i32, y: i32| im.px[(y * im.w + x) as usize];
+    for y in 0..TILE {
+        for x in 0..TILE {
+            if x < 2 || y < 2 || x >= TILE - 2 || y >= TILE - 2 {
+                im.set(x, y, 0);
+            }
+        }
+    }
+    for k in 8..16 {
+        for (edge, inner) in [(2, 3), (TILE - 3, TILE - 4)] {
+            for row in [edge, inner] {
+                let (h, v) = (get(&im, 7, row), get(&im, row, 7));
+                im.set(k, row, h);
+                im.set(row, k, v);
+            }
+        }
+    }
+    im
+}
+
+/// Отделка корпуса машины по уровню: кант по кромке и накладки на углах. Рисунок
+/// симметричный, поэтому не зависит от направления машины.
+fn level_trim(level: u8, frame: i32) -> Image {
+    let mut im = Image::new(TILE, TILE);
+    let col = match level {
+        2 => hex(0xD9924A),
+        3 => hex(0xE4E8F2),
+        _ => GOLD,
+    };
+    // Кант по кромке корпуса.
+    for k in 6..18 {
+        for (x, y) in [(k, 3), (k, 20), (3, k), (20, k)] {
+            im.set(x, y, col);
+        }
+    }
+    // Накладки на углах.
+    if level >= 2 {
+        for (cx, cy, sx, sy) in [(4, 4, 1, 1), (19, 4, -1, 1), (4, 19, 1, -1), (19, 19, -1, -1)] {
+            im.set(cx, cy, OUTLINE);
+            im.set(cx + sx, cy, col);
+            im.set(cx, cy + sy, col);
+            im.set(cx + sx, cy + sy, shade(col, 0.8));
+        }
+    }
+    // Уровень 4 - двойной кант; уровень 5 - ещё и камни по углам, мерцающие по очереди.
+    if level >= 4 {
+        for k in 8..16 {
+            for (x, y) in [(k, 4), (k, 19), (4, k), (19, k)] {
+                im.set(x, y, shade(col, 0.72));
+            }
+        }
+    }
+    if level >= 5 {
+        for (i, (x, y)) in [(5, 5), (17, 5), (17, 17), (5, 17)].into_iter().enumerate() {
+            im.fill_rect(x - 1, y - 1, 4, 4, OUTLINE);
+            im.fill_rect(x, y, 2, 2, hex(0x58D4F0));
+            if i as i32 == frame % 4 {
+                im.fill_rect(x, y, 2, 2, hex(0xFFF6DC));
+            } else {
+                im.set(x, y, hex(0xBFF0FF));
+            }
         }
     }
     im
