@@ -21,9 +21,25 @@ void main() {
    color.g=0.0;
    color.b=0.0;
    sign_=0;
-   v1 = kernal(origin + dir * (step_*len));
-   v2 = kernal(origin);
-   for (int k = 2; k < 1002; k++) {
+   // Вне сферы |p| > 6^(1/8) = 1.2511 формула заведомо отрицательна (выход на
+   // первой же итерации), поэтому шагаем только по отрезку луча внутри сферы
+   // радиуса 1.26 с запасом в три шага — результат тот же, что у полного цикла.
+   float od = dot(origin, dir), dd = dot(dir, dir);
+   float disc = od*od - dd*(dot(origin, origin) - 1.5876);
+   if (disc <= 0.0) {
+      gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);
+      return;
+   }
+   disc = sqrt(disc);
+   int kmin = int(max(2.0, floor((-od - disc) / (dd*step_*len)) - 3.0));
+   int kmax = int(min(1001.0, ceil((-od + disc) / (dd*step_*len)) + 3.0));
+   v1 = kernal(origin + dir * (step_*len*float(kmin - 1)));
+   v2 = kernal(origin + dir * (step_*len*float(kmin - 2)));
+   for (int j = 0; j < 1000; j++) {
+      int k = kmin + j;
+      if (k > kmax) {
+         break;
+      }
       ver = origin + dir * (step_*len*float(k));
       v = kernal(ver);
       if (v > 0.0 && v1 < 0.0) {
