@@ -1,13 +1,28 @@
 [package]
 name = "alembic"
-version = "0.6.1"
+version = "0.7.0"
 edition = "2021"
 description = "Alembic - алхимический фабричный тайкун на собственном мини-движке"
 
+# Библиотека нужна только Android: NativeActivity грузит игру как libalembic_android.so.
+# На остальных платформах она пустая (см. src/android.rs).
+[lib]
+name = "alembic_android"
+path = "src/android.rs"
+crate-type = ["cdylib"]
+
 [dependencies]
+tinyaudio = "1"
+
+[target.'cfg(windows)'.dependencies]
 minifb = "0.27"
 steamworks = "0.13.1"
-tinyaudio = "1"
+gilrs = "0.11"
+
+[target.'cfg(target_os = "android")'.dependencies]
+android-activity = { version = "0.6", features = ["native-activity"] }
+ndk = "0.9"
+ndk-sys = "0.6"
 
 [profile.dev]
 opt-level = 2

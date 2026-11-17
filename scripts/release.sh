@@ -18,9 +18,12 @@ if [ -n "$(git status --porcelain)" ]; then
     exit 1
 fi
 
-cargo build --release
-PATH="$PWD/target/release:$PATH" cargo test --release
-cargo build --release --manifest-path installer/Cargo.toml
+# GNU-тулчейн на этой машине не собирает windows-* крейты (dlltool), поэтому MSVC.
+# C-рантайм вшивается в exe (.cargo/config.toml): игрокам не нужен VC++ Redistributable.
+tc="+${ALEMBIC_TOOLCHAIN:-stable-x86_64-pc-windows-msvc}"
+cargo "$tc" build --release
+PATH="$PWD/target/release:$PATH" cargo "$tc" test --release
+cargo "$tc" build --release --manifest-path installer/Cargo.toml
 mkdir -p dist
 cp -f installer/target/release/AlembicSetup.exe dist/AlembicSetup.exe
 

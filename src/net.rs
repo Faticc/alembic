@@ -1,21 +1,29 @@
-//! Сетевая игра через Steam (тестовый AppID 480 "Spacewar"): лобби + ISteamNetworkingMessages.
+//! Сетевая игра. Два транспорта под одним протоколом:
+//! - Steam (тестовый AppID 480 "Spacewar"): лобби + ISteamNetworkingMessages, только на ПК;
+//! - прямое соединение по TCP: комнаты в локальной сети находятся сами (UDP), в остальных
+//!   случаях входят по IP. Так играют телефон и ПК: клиента Steam на телефоне нет.
 //!
 //! Схема: хост - единственный источник правды. Клиенты шлют команды строительства,
 //! хост применяет их и рассылает всем результат и состояние экономики. Предметы на
 //! лентах каждый клиент досчитывает сам - они только для вида.
 
 use crate::world::{Dir, Kind, N_ALL_IDS};
+use std::cell::RefCell;
+use std::io::{ErrorKind, Read, Write};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use steamworks::networking_messages::SessionRequest;
-use steamworks::networking_types::{NetworkingIdentity, SendFlags};
-use steamworks::{
-    CallbackHandle, Client, DistanceFilter, GameLobbyJoinRequested, LobbyId, LobbyKey, LobbyType, SteamId,
-    StringFilter, StringFilterKind,
-};
 
-pub const APP_ID: u32 = 480;
-/// Метка комнаты включает версию протокола: старые и новые сборки друг друга не видят.
-const LOBBY_TAG: &str = "alembic_tycoon_v7";
+/// Игрок в сети: SteamID или случайный номер тех, кто пришёл по TCP.
+pub type PeerId = u64;
+
+/// Порт комнаты: TCP - игра, UDP - поиск комнат в локальной сети.
+pub const PORT: u16 = 24642;
+/// Первое сообщение соединения по TCP: метка с версией протокола, за ней номер игрока.
+const MAGIC: &[u8; 8] = b"ALEMBIC7";
+const ASK: &[u8] = b"ALEMBIC?7";
+const ANSWER: &[u8] = b"ALEMBIC!7";
+/// Больше этого сообщение быть не может: соединение с мусором закрывается.
+const MAX_FRAME: usize = 4 << 20;
 const TIMEOUT: f32 = 12.0;
 /// Как часто мерить пинг, секунды.
 const PING_EVERY: f32 = 1.0;
@@ -80,7 +88,7 @@ pub struct StateMsg {
 
 pub enum NetEvent {
     /// Хосту: игрок подключился, ему нужно отправить мир.
-    Hello(SteamId, String),
+    Hello(PeerId, String),
     /// Хосту: команда от игрока.
     Cmd(Cmd),
     /// Клиенту: снимок мира, изменение постройки, состояние экономики.
@@ -125,7 +133,7 @@ fn rd_pres(r: &mut Rd) -> Option<Presence> {
 }
 
 pub struct Peer {
-    pub id: SteamId,
+    pub id: PeerId,
     pub name: String,
     pub p: Presence,
     silence: f32,
@@ -133,18 +141,979 @@ pub struct Peer {
     pub ping_ms: Option<f32>,
 }
 
+/// Куда стучаться, чтобы войти в комнату.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum RoomAddr {
+    /// Лобби Steam.
+    Steam(u64),
+    /// Комната в локальной сети или по IP.
+    Lan(SocketAddr),
+}
+
 pub struct LobbyInfo {
-    pub id: LobbyId,
+    pub addr: RoomAddr,
     pub name: String,
     pub members: usize,
 }
 
-enum Ev {
-    Created(Result<LobbyId, String>),
-    Joined(Result<LobbyId, ()>),
-    List(Vec<LobbyId>),
-    JoinRequested(LobbyId),
-    Session(SessionRequest),
+/// То, что Steam сообщает сетевому слою, уже без типов Steam.
+enum SteamEv {
+    Created(Result<(), String>),
+    /// Вошли в лобби: номер его хозяина.
+    Joined(Result<u64, ()>),
+    List(Vec<(u64, String, usize)>),
+    JoinRequested(u64),
+}
+
+#[cfg(windows)]
+mod steam {
+    use super::SteamEv;
+    use std::sync::mpsc::{channel, Receiver, Sender};
+    use steamworks::networking_messages::SessionRequest;
+    use steamworks::networking_types::{NetworkingIdentity, SendFlags};
+    use steamworks::{
+        CallbackHandle, Client, DistanceFilter, GameLobbyJoinRequested, LobbyId, LobbyKey, LobbyType, SteamId,
+        StringFilter, StringFilterKind,
+    };
+
+    const APP_ID: u32 = 480;
+    /// Метка комнаты включает версию протокола: старые и новые сборки друг друга не видят.
+    const LOBBY_TAG: &str = "alembic_tycoon_v7";
+
+    enum Raw {
+        Created(Result<LobbyId, String>),
+        Joined(Result<LobbyId, ()>),
+        List(Vec<LobbyId>),
+        JoinRequested(LobbyId),
+        Session(SessionRequest),
+    }
+
+    pub struct Steam {
+        client: Client,
+        rx: Receiver<Raw>,
+        tx: Sender<Raw>,
+        _handles: Vec<CallbackHandle>,
+        lobby: Option<LobbyId>,
+        pub name: String,
+        pub id: u64,
+    }
+
+    impl Steam {
+        /// Подключается к запущенному клиенту Steam.
+        pub fn connect() -> Result<Steam, String> {
+            let client = Client::init_app(APP_ID).map_err(|e| format!("{:?}", e))?;
+            let (tx, rx) = channel();
+            let t = tx.clone();
+            client.networking_messages().session_request_callback(move |req| {
+                let _ = t.send(Raw::Session(req));
+            });
+            let t = tx.clone();
+            let handle = client.register_callback(move |r: GameLobbyJoinRequested| {
+                let _ = t.send(Raw::JoinRequested(r.lobby_steam_id));
+            });
+            let name = client.friends().name();
+            let id = client.user().steam_id().raw();
+            Ok(Steam { client, rx, tx, _handles: vec![handle], lobby: None, name, id })
+        }
+
+        pub fn create_lobby(&self) {
+            let tx = self.tx.clone();
+            self.client.matchmaking().create_lobby(LobbyType::Public, 8, move |r| {
+                let _ = tx.send(Raw::Created(r.map_err(|e| format!("{:?}", e))));
+            });
+        }
+
+        pub fn request_list(&self) {
+            let tx = self.tx.clone();
+            let mm = self.client.matchmaking();
+            mm.add_request_lobby_list_string_filter(StringFilter(LobbyKey::new("game"), LOBBY_TAG, StringFilterKind::Equal));
+            mm.set_request_lobby_list_distance_filter(DistanceFilter::Worldwide);
+            mm.request_lobby_list(move |r| {
+                let _ = tx.send(Raw::List(r.unwrap_or_default()));
+            });
+        }
+
+        pub fn join(&self, lobby: u64) {
+            let tx = self.tx.clone();
+            self.client.matchmaking().join_lobby(LobbyId::from_raw(lobby), move |r| {
+                let _ = tx.send(Raw::Joined(r));
+            });
+        }
+
+        pub fn leave_lobby(&mut self) {
+            if let Some(l) = self.lobby.take() {
+                self.client.matchmaking().leave_lobby(l);
+            }
+        }
+
+        pub fn send(&self, to: u64, data: &[u8], reliable: bool) {
+            let flags = if reliable { SendFlags::RELIABLE } else { SendFlags::UNRELIABLE }
+                | SendFlags::AUTO_RESTART_BROKEN_SESSION;
+            let to = NetworkingIdentity::new_steam_id(SteamId::from_raw(to));
+            let _ = self.client.networking_messages().send_message_to_user(to, flags, data, 0);
+        }
+
+        /// В тестовом приложении Spacewar наших достижений нет - тогда Steam просто отказывает.
+        pub fn achievement(&self, id: &str) -> bool {
+            let stats = self.client.user_stats();
+            stats.achievement(id).set().is_ok() && stats.store_stats().is_ok()
+        }
+
+        /// Колбэки Steam и входящие сообщения.
+        pub fn poll(&mut self, evs: &mut Vec<SteamEv>, msgs: &mut Vec<(u64, Vec<u8>)>) {
+            self.client.run_callbacks();
+            let mm = self.client.matchmaking();
+            while let Ok(ev) = self.rx.try_recv() {
+                match ev {
+                    Raw::Created(Ok(l)) => {
+                        mm.set_lobby_data(l, "game", LOBBY_TAG);
+                        mm.set_lobby_data(l, "name", &self.name);
+                        self.lobby = Some(l);
+                        evs.push(SteamEv::Created(Ok(())));
+                    }
+                    Raw::Created(Err(e)) => evs.push(SteamEv::Created(Err(e))),
+                    Raw::Joined(Ok(l)) => {
+                        self.lobby = Some(l);
+                        evs.push(SteamEv::Joined(Ok(mm.lobby_owner(l).raw())));
+                    }
+                    Raw::Joined(Err(())) => evs.push(SteamEv::Joined(Err(()))),
+                    Raw::List(ids) => evs.push(SteamEv::List(
+                        ids.into_iter()
+                            .take(8)
+                            .map(|id| {
+                                let name = mm.lobby_data(id, "name").unwrap_or_else(|| "?".to_string());
+                                (id.raw(), name, mm.lobby_member_count(id))
+                            })
+                            .collect(),
+                    )),
+                    Raw::JoinRequested(l) => evs.push(SteamEv::JoinRequested(l.raw())),
+                    Raw::Session(req) => {
+                        // Принимаем соединения только от участников нашей комнаты.
+                        let known = match (self.lobby, req.remote().steam_id()) {
+                            (Some(l), Some(id)) => mm.lobby_members(l).contains(&id),
+                            _ => false,
+                        };
+                        if known {
+                            req.accept();
+                        }
+                    }
+                }
+            }
+            let nm = self.client.networking_messages();
+            for _ in 0..8 {
+                let batch = nm.receive_messages_on_channel(0, 64);
+                if batch.is_empty() {
+                    break;
+                }
+                for m in batch {
+                    if let Some(from) = m.identity_peer().steam_id() {
+                        msgs.push((from.raw(), m.data().to_vec()));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Там, где клиента Steam нет (телефон), остаётся только прямое соединение.
+#[cfg(not(windows))]
+mod steam {
+    use super::SteamEv;
+
+    pub struct Steam {
+        pub name: String,
+        pub id: u64,
+    }
+
+    impl Steam {
+        pub fn connect() -> Result<Steam, String> {
+            Err("НЕТ НА ЭТОМ УСТРОЙСТВЕ".to_string())
+        }
+        pub fn create_lobby(&self) {}
+        pub fn request_list(&self) {}
+        pub fn join(&self, _lobby: u64) {}
+        pub fn leave_lobby(&mut self) {}
+        pub fn send(&self, _to: u64, _data: &[u8], _reliable: bool) {}
+        pub fn achievement(&self, _id: &str) -> bool {
+            false
+        }
+        pub fn poll(&mut self, _evs: &mut Vec<SteamEv>, _msgs: &mut Vec<(u64, Vec<u8>)>) {}
+    }
+}
+
+use steam::Steam;
+
+// ---------- прямое соединение ----------
+
+/// Соединение по TCP. Сообщения идут подряд, перед каждым - длина (4 байта).
+struct Conn {
+    /// Номер игрока на том конце; 0 - пока не пришло приветствие.
+    id: PeerId,
+    stream: TcpStream,
+    inbuf: Vec<u8>,
+    outbuf: Vec<u8>,
+    dead: bool,
+    age: f32,
+}
+
+impl Conn {
+    fn new(stream: TcpStream, my_id: PeerId) -> Option<Conn> {
+        let _ = stream.set_nodelay(true);
+        stream.set_nonblocking(true).ok()?;
+        let mut c = Conn { id: 0, stream, inbuf: Vec::new(), outbuf: Vec::new(), dead: false, age: 0.0 };
+        let mut hello = MAGIC.to_vec();
+        hello.extend_from_slice(&my_id.to_le_bytes());
+        c.queue(&hello);
+        Some(c)
+    }
+
+    fn queue(&mut self, data: &[u8]) {
+        self.outbuf.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        self.outbuf.extend_from_slice(data);
+        self.flush();
+    }
+
+    fn flush(&mut self) {
+        while !self.outbuf.is_empty() && !self.dead {
+            match self.stream.write(&self.outbuf) {
+                Ok(0) => self.dead = true,
+                Ok(n) => {
+                    self.outbuf.drain(..n);
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                Err(_) => self.dead = true,
+            }
+        }
+        // Тот конец не читает: копить без конца незачем.
+        if self.outbuf.len() > 4 * MAX_FRAME {
+            self.dead = true;
+        }
+    }
+
+    /// Читает всё, что пришло, и отдаёт целые сообщения.
+    fn read(&mut self, frames: &mut Vec<Vec<u8>>) {
+        let mut buf = [0u8; 16384];
+        while !self.dead {
+            match self.stream.read(&mut buf) {
+                Ok(0) => self.dead = true,
+                Ok(n) => self.inbuf.extend_from_slice(&buf[..n]),
+                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                Err(_) => self.dead = true,
+            }
+        }
+        let mut at = 0;
+        while self.inbuf.len() - at >= 4 {
+            let n = u32::from_le_bytes(self.inbuf[at..at + 4].try_into().unwrap()) as usize;
+            if n > MAX_FRAME {
+                self.dead = true;
+                break;
+            }
+            if self.inbuf.len() - at - 4 < n {
+                break;
+            }
+            frames.push(self.inbuf[at + 4..at + 4 + n].to_vec());
+            at += 4 + n;
+        }
+        self.inbuf.drain(..at);
+    }
+}
+
+/// Адрес этого устройства в локальной сети. Соединение UDP ничего не отправляет: система
+/// лишь выбирает, с какого адреса она пошла бы наружу.
+fn local_ip() -> Option<Ipv4Addr> {
+    let s = UdpSocket::bind("0.0.0.0:0").ok()?;
+    s.connect("8.8.8.8:80").ok()?;
+    match s.local_addr().ok()?.ip() {
+        IpAddr::V4(ip) if !ip.is_unspecified() && !ip.is_loopback() => Some(ip),
+        _ => None,
+    }
+}
+
+/// Имя игрока, когда его не подсказал Steam.
+fn device_name() -> String {
+    #[cfg(target_os = "android")]
+    {
+        extern "C" {
+            fn __system_property_get(name: *const u8, value: *mut u8) -> i32;
+        }
+        // PROP_VALUE_MAX = 92.
+        let mut buf = [0u8; 96];
+        let n = unsafe { __system_property_get(b"ro.product.model\0".as_ptr(), buf.as_mut_ptr()) };
+        if n > 0 {
+            return String::from_utf8_lossy(&buf[..n as usize]).chars().take(16).collect();
+        }
+    }
+    std::env::var("USERNAME").ok().filter(|s| !s.is_empty()).map_or("ИГРОК".to_string(), |s| s.chars().take(16).collect())
+}
+
+/// "192.168.1.5" или "192.168.1.5:24642".
+pub fn parse_addr(text: &str) -> Option<SocketAddr> {
+    let t = text.trim();
+    t.parse::<SocketAddr>().ok().or_else(|| t.parse::<Ipv4Addr>().ok().map(|ip| SocketAddr::new(IpAddr::V4(ip), PORT)))
+}
+
+// ---------- сеть ----------
+
+pub struct Net {
+    steam: Option<Steam>,
+    /// Итог подключения по TCP приходит из фонового потока.
+    rx: Receiver<Result<TcpStream, String>>,
+    tx: Sender<Result<TcpStream, String>>,
+    conns: RefCell<Vec<Conn>>,
+    listener: Option<TcpListener>,
+    /// Хост: отвечает на поиск комнат. Клиент: рассылает поиск и ждёт ответы.
+    udp: Option<UdpSocket>,
+    scan_t: f32,
+    scan_ping_t: f32,
+    /// Адрес хоста в локальной сети - его называют тем, кто входит по IP.
+    pub lan_ip: Option<String>,
+    pub mode: Mode,
+    pub status: String,
+    pub my_name: String,
+    my_id: PeerId,
+    host: Option<PeerId>,
+    /// Другие игроки (у клиента - по рассылке хоста, включая самого хоста).
+    pub peers: Vec<Peer>,
+    pub lobbies: Vec<LobbyInfo>,
+    pub busy: bool,
+    synced: bool,
+    hello_t: f32,
+    host_silence: f32,
+    cursor: Presence,
+    cursor_t: f32,
+    state_t: f32,
+    clock: std::time::Instant,
+    ping_t: f32,
+    /// Клиенту: пинг до хоста, мс.
+    pub ping_ms: Option<f32>,
+}
+
+impl Net {
+    pub fn new() -> Net {
+        let (tx, rx) = channel();
+        Net {
+            steam: None,
+            rx,
+            tx,
+            conns: RefCell::new(Vec::new()),
+            listener: None,
+            udp: None,
+            scan_t: 0.0,
+            scan_ping_t: 0.0,
+            lan_ip: None,
+            mode: Mode::Offline,
+            status: "НЕ В СЕТИ".to_string(),
+            my_name: String::new(),
+            my_id: 0,
+            host: None,
+            peers: Vec::new(),
+            lobbies: Vec::new(),
+            busy: false,
+            synced: false,
+            hello_t: 0.0,
+            host_silence: 0.0,
+            cursor: Presence::default(),
+            cursor_t: 0.0,
+            state_t: 0.0,
+            clock: std::time::Instant::now(),
+            ping_t: 0.0,
+            ping_ms: None,
+        }
+    }
+
+    /// Готовит сеть: подключается к клиенту Steam, если он есть, иначе берёт имя устройства
+    /// и случайный номер игрока. false - Steam недоступен, игра возможна только напрямую.
+    pub fn ensure(&mut self) -> bool {
+        if self.steam.is_none() && cfg!(windows) && !cfg!(test) && !self.online() && !self.busy {
+            match Steam::connect() {
+                Ok(s) => {
+                    self.my_name = s.name.clone();
+                    self.my_id = s.id;
+                    self.status = format!("STEAM: {}", self.my_name);
+                    self.steam = Some(s);
+                }
+                Err(e) => self.status = format!("STEAM НЕДОСТУПЕН ({}): ИГРА ПО СЕТИ ИЛИ IP", e).to_uppercase(),
+            }
+        }
+        if self.my_id == 0 {
+            // Старший байт не совпадает ни с одним SteamID.
+            let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_nanos() as u64);
+            self.my_id = 0xA1u64 << 56 | (t.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 8).max(1);
+            self.my_name = device_name();
+            if !cfg!(windows) {
+                self.status = "ИГРА ПО WI-FI ИЛИ IP".to_string();
+            }
+        }
+        self.steam.is_some()
+    }
+
+    pub fn online(&self) -> bool {
+        self.mode != Mode::Offline
+    }
+
+    /// Открывает комнату: в локальной сети сразу, в Steam - когда он создаст лобби.
+    pub fn host_game(&mut self) {
+        self.ensure();
+        if self.online() || self.busy {
+            return;
+        }
+        self.listener = TcpListener::bind(("0.0.0.0", PORT)).ok().filter(|l| l.set_nonblocking(true).is_ok());
+        self.udp = UdpSocket::bind(("0.0.0.0", PORT)).ok().filter(|s| s.set_nonblocking(true).is_ok());
+        self.lan_ip = self.listener.as_ref().and(local_ip()).map(|ip| ip.to_string());
+        if let Some(s) = &self.steam {
+            self.busy = true;
+            self.status = "СОЗДАЮ КОМНАТУ...".to_string();
+            s.create_lobby();
+        } else if self.listener.is_some() {
+            self.become_host();
+        } else {
+            self.status = format!("НЕ УДАЛОСЬ ОТКРЫТЬ КОМНАТУ: ПОРТ {} ЗАНЯТ", PORT);
+        }
+    }
+
+    fn become_host(&mut self) {
+        self.mode = Mode::Host;
+        self.peers.clear();
+        self.status = match &self.lan_ip {
+            Some(ip) => format!("ТЫ ХОСТ. КОМНАТА ОТКРЫТА, IP {}", ip),
+            None => "ТЫ ХОСТ. КОМНАТА ОТКРЫТА".to_string(),
+        };
+    }
+
+    /// Ищет комнаты: в Steam и рассылкой по локальной сети.
+    pub fn refresh(&mut self) {
+        self.ensure();
+        if self.busy || self.online() {
+            return;
+        }
+        self.lobbies.clear();
+        self.status = "ИЩУ КОМНАТЫ...".to_string();
+        if let Some(s) = &self.steam {
+            self.busy = true;
+            s.request_list();
+        }
+        self.udp = UdpSocket::bind("0.0.0.0:0").ok().filter(|s| s.set_nonblocking(true).is_ok() && s.set_broadcast(true).is_ok());
+        self.scan_t = 1.6;
+        self.scan_ping_t = 0.0;
+    }
+
+    /// Вопрос "есть тут комнаты?" всем в локальной сети.
+    fn scan_ping(&self) {
+        if let Some(s) = &self.udp {
+            let _ = s.send_to(ASK, (Ipv4Addr::BROADCAST, PORT));
+            // Общая рассылка уходит только с одного сетевого адаптера, поэтому отдельно
+            // спрашиваем свою подсеть (в домашних сетях она почти всегда /24).
+            if let Some(ip) = local_ip() {
+                let o = ip.octets();
+                let _ = s.send_to(ASK, (Ipv4Addr::new(o[0], o[1], o[2], 255), PORT));
+            }
+        }
+    }
+
+    pub fn join(&mut self, room: RoomAddr) {
+        self.ensure();
+        if self.busy {
+            return;
+        }
+        if self.online() {
+            self.leave();
+        }
+        match room {
+            RoomAddr::Steam(id) => {
+                if let Some(s) = &self.steam {
+                    self.busy = true;
+                    self.status = "ПОДКЛЮЧАЮСЬ...".to_string();
+                    s.join(id);
+                }
+            }
+            RoomAddr::Lan(addr) => {
+                self.busy = true;
+                self.status = format!("ПОДКЛЮЧАЮСЬ К {}...", addr.ip());
+                let tx = self.tx.clone();
+                std::thread::spawn(move || {
+                    let r = TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(5));
+                    let _ = tx.send(r.map_err(|e| format!("{:?}", e.kind())));
+                });
+            }
+        }
+    }
+
+    /// Вход по набранному адресу. false - адрес не разобрать.
+    pub fn join_ip(&mut self, text: &str) -> bool {
+        match parse_addr(text) {
+            Some(addr) => {
+                self.join(RoomAddr::Lan(addr));
+                true
+            }
+            None => {
+                self.status = "НЕПОНЯТНЫЙ АДРЕС. ПРИМЕР: 192.168.1.5".to_string();
+                false
+            }
+        }
+    }
+
+    pub fn leave(&mut self) {
+        let bye = Wr::new(T_BYE).0;
+        match self.mode {
+            Mode::Host => self.broadcast(&bye, true),
+            Mode::Client => {
+                if let Some(h) = self.host {
+                    self.send(h, &bye, true);
+                }
+            }
+            Mode::Offline => {}
+        }
+        if let Some(s) = &mut self.steam {
+            s.leave_lobby();
+        }
+        self.conns.borrow_mut().clear();
+        self.listener = None;
+        self.udp = None;
+        self.scan_t = 0.0;
+        self.lan_ip = None;
+        self.mode = Mode::Offline;
+        self.host = None;
+        self.peers.clear();
+        self.synced = false;
+        self.ping_ms = None;
+        self.status = "НЕ В СЕТИ".to_string();
+    }
+
+    fn send(&self, to: PeerId, data: &[u8], reliable: bool) {
+        if let Some(c) = self.conns.borrow_mut().iter_mut().find(|c| c.id == to && !c.dead) {
+            c.queue(data);
+        } else if let Some(s) = &self.steam {
+            s.send(to, data, reliable);
+        }
+    }
+
+    fn broadcast(&self, data: &[u8], reliable: bool) {
+        for p in &self.peers {
+            self.send(p.id, data, reliable);
+        }
+    }
+
+    pub fn send_cmd(&self, c: &Cmd) {
+        if let (Mode::Client, Some(h)) = (self.mode, self.host) {
+            self.send(h, &enc_cmd(c), true);
+        }
+    }
+
+    pub fn broadcast_op(&self, o: &Op) {
+        if self.mode == Mode::Host {
+            self.broadcast(&enc_op(o), true);
+        }
+    }
+
+    /// Хост: разослать всем новый снимок мира (после нового витка карта пустая).
+    pub fn broadcast_world(&self, text: &str) {
+        if self.mode == Mode::Host {
+            self.broadcast(&Wr::new(T_WORLD).str(text).0, true);
+        }
+    }
+
+    /// Отмечает достижение в Steam, если клиент подключён. В тестовом приложении Spacewar
+    /// наших достижений нет - тогда Steam просто отказывает, игра показывает достижение сама.
+    pub fn achievement(&self, id: &str) -> bool {
+        self.steam.as_ref().map_or(false, |s| s.achievement(id))
+    }
+
+    pub fn send_world(&self, to: PeerId, text: &str) {
+        self.send(to, &Wr::new(T_WORLD).str(text).0, true);
+    }
+
+    /// Хосту: пора ли разослать состояние экономики (3 раза в секунду).
+    pub fn state_due(&mut self) -> bool {
+        if self.mode == Mode::Host && !self.peers.is_empty() && self.state_t <= 0.0 {
+            self.state_t = 0.33;
+            return true;
+        }
+        false
+    }
+
+    pub fn broadcast_state(&self, s: &StateMsg) {
+        self.broadcast(&enc_state(s), true);
+    }
+
+    pub fn broadcast_logic(&self, ticks: u64, st: &[(bool, u32, bool)]) {
+        if !st.is_empty() {
+            self.broadcast(&enc_logic(ticks, st), true);
+        }
+    }
+
+    /// Подставной игрок для скриншота-самопроверки (в сеть ничего не уходит).
+    pub fn fake_peer(&mut self, id: PeerId, name: &str, p: Presence) {
+        self.peers.push(Peer { id, name: name.to_string(), p, silence: 0.0, ping_ms: None });
+    }
+
+    /// Пинг для счётчика: клиенту - до хоста, хосту - до самого медленного игрока.
+    pub fn ping(&self) -> Option<f32> {
+        match self.mode {
+            Mode::Client => self.ping_ms,
+            Mode::Host => self.peers.iter().filter_map(|p| p.ping_ms).reduce(f32::max),
+            Mode::Offline => None,
+        }
+    }
+
+    fn now_us(&self) -> u64 {
+        self.clock.elapsed().as_micros() as u64
+    }
+
+    pub fn set_presence(&mut self, p: Presence) {
+        self.cursor = p;
+    }
+
+    fn handle(&mut self, from: PeerId, data: &[u8], out: &mut Vec<NetEvent>) {
+        let mut r = Rd(data);
+        let tag = match r.u8() {
+            Some(t) => t,
+            None => return,
+        };
+        // Пинг одинаков у хоста и клиента: на T_PING отвечаем сразу, по T_PONG считаем задержку.
+        let known = match self.mode {
+            Mode::Host => self.peers.iter().any(|p| p.id == from),
+            Mode::Client => Some(from) == self.host,
+            Mode::Offline => false,
+        };
+        if known && (tag == T_PING || tag == T_PONG) {
+            if let Some(t) = r.u64() {
+                if tag == T_PING {
+                    self.send(from, &Wr::new(T_PONG).u64(t).0, false);
+                } else {
+                    let rtt = self.now_us().saturating_sub(t) as f32 / 1000.0;
+                    match self.mode {
+                        Mode::Host => {
+                            if let Some(p) = self.peers.iter_mut().find(|p| p.id == from) {
+                                p.ping_ms = Some(smooth_ping(p.ping_ms, rtt));
+                            }
+                        }
+                        _ => self.ping_ms = Some(smooth_ping(self.ping_ms, rtt)),
+                    }
+                }
+            }
+            return;
+        }
+        match self.mode {
+            Mode::Host => {
+                if tag == T_HELLO {
+                    let name = r.str().unwrap_or_default();
+                    if let Some(p) = self.peers.iter_mut().find(|p| p.id == from) {
+                        p.silence = 0.0;
+                    } else if self.peers.len() < 7 {
+                        self.peers.push(Peer { id: from, name: name.clone(), p: Presence::default(), silence: 0.0, ping_ms: None });
+                        out.push(NetEvent::Info(format!("{} ПОДКЛЮЧИЛСЯ", name)));
+                    } else {
+                        return;
+                    }
+                    out.push(NetEvent::Hello(from, name));
+                    return;
+                }
+                let idx = match self.peers.iter().position(|p| p.id == from) {
+                    Some(i) => i,
+                    None => return,
+                };
+                self.peers[idx].silence = 0.0;
+                match tag {
+                    T_CMD => {
+                        if let Some(c) = dec_cmd(&mut r) {
+                            out.push(NetEvent::Cmd(c));
+                        }
+                    }
+                    T_CURSOR => {
+                        if let Some(p) = rd_pres(&mut r) {
+                            self.peers[idx].p = p;
+                        }
+                    }
+                    T_BYE => {
+                        let p = self.peers.remove(idx);
+                        self.conns.borrow_mut().retain(|c| c.id != p.id);
+                        out.push(NetEvent::Info(format!("{} ОТКЛЮЧИЛСЯ", p.name)));
+                    }
+                    _ => {}
+                }
+            }
+            Mode::Client => {
+                if Some(from) != self.host {
+                    return;
+                }
+                self.host_silence = 0.0;
+                match tag {
+                    T_WORLD => {
+                        if let Some(s) = r.str() {
+                            self.synced = true;
+                            self.status = "В ЧУЖОЙ КОМНАТЕ".to_string();
+                            out.push(NetEvent::World(s));
+                        }
+                    }
+                    T_OP if self.synced => {
+                        if let Some(o) = dec_op(&mut r) {
+                            out.push(NetEvent::Op(o));
+                        }
+                    }
+                    T_STATE if self.synced => {
+                        if let Some(st) = dec_state(&mut r) {
+                            out.push(NetEvent::State(st));
+                        }
+                    }
+                    T_LOGIC if self.synced => {
+                        if let Some((ticks, st)) = dec_logic(&mut r) {
+                            out.push(NetEvent::Logic(ticks, st));
+                        }
+                    }
+                    T_CURSORS => {
+                        self.peers.clear();
+                        while let (Some(id), Some(p), Some(name)) = (r.u64(), rd_pres(&mut r), r.str()) {
+                            if id != self.my_id && self.peers.len() < 8 {
+                                self.peers.push(Peer { id, name, p, silence: 0.0, ping_ms: None });
+                            }
+                        }
+                    }
+                    T_BYE => {
+                        self.leave();
+                        out.push(NetEvent::Lost("ХОСТ ЗАКРЫЛ КОМНАТУ".to_string()));
+                    }
+                    _ => {}
+                }
+            }
+            Mode::Offline => {}
+        }
+    }
+
+    fn poll_steam(&mut self, msgs: &mut Vec<(PeerId, Vec<u8>)>) {
+        let mut evs = Vec::new();
+        match &mut self.steam {
+            Some(s) => s.poll(&mut evs, msgs),
+            None => return,
+        }
+        for ev in evs {
+            match ev {
+                SteamEv::Created(Ok(())) => {
+                    self.busy = false;
+                    self.become_host();
+                }
+                SteamEv::Created(Err(e)) => {
+                    self.busy = false;
+                    if self.listener.is_some() {
+                        // Лобби Steam не создалось, но в локальной сети комната открыта.
+                        self.become_host();
+                    } else {
+                        self.status = format!("НЕ УДАЛОСЬ СОЗДАТЬ: {}", e).to_uppercase();
+                    }
+                }
+                SteamEv::Joined(Ok(owner)) => {
+                    self.busy = false;
+                    self.start_client(Some(owner));
+                }
+                SteamEv::Joined(Err(())) => {
+                    self.busy = false;
+                    self.status = "НЕ УДАЛОСЬ ВОЙТИ В КОМНАТУ".to_string();
+                }
+                SteamEv::List(list) => {
+                    self.busy = false;
+                    for (id, name, members) in list {
+                        self.lobbies.push(LobbyInfo { addr: RoomAddr::Steam(id), name: format!("{} - STEAM", name), members });
+                    }
+                    self.status = format!("НАЙДЕНО КОМНАТ: {}", self.lobbies.len());
+                }
+                SteamEv::JoinRequested(l) => self.join(RoomAddr::Steam(l)),
+            }
+        }
+    }
+
+    fn start_client(&mut self, host: Option<PeerId>) {
+        self.host = host;
+        self.mode = Mode::Client;
+        self.synced = false;
+        self.hello_t = 0.0;
+        self.host_silence = 0.0;
+        self.peers.clear();
+        self.status = "ЖДУ МИР ОТ ХОСТА...".to_string();
+    }
+
+    /// Прямые соединения: новые игроки, поиск комнат, входящие сообщения.
+    fn poll_lan(&mut self, dt: f32, msgs: &mut Vec<(PeerId, Vec<u8>)>, out: &mut Vec<NetEvent>) {
+        // Итог подключения к комнате по адресу.
+        while let Ok(r) = self.rx.try_recv() {
+            self.busy = false;
+            match r.ok().and_then(|s| Conn::new(s, self.my_id)) {
+                Some(c) if !self.online() => {
+                    self.conns.borrow_mut().push(c);
+                    self.udp = None;
+                    self.scan_t = 0.0;
+                    self.start_client(None);
+                }
+                Some(_) => {}
+                None => self.status = "НЕ УДАЛОСЬ ПОДКЛЮЧИТЬСЯ: КОМНАТА НЕ ОТВЕЧАЕТ".to_string(),
+            }
+        }
+        // Хост: принять тех, кто постучался, и ответить ищущим комнаты.
+        if self.mode == Mode::Host {
+            if let Some(l) = &self.listener {
+                while let Ok((s, _)) = l.accept() {
+                    if let Some(c) = Conn::new(s, self.my_id) {
+                        self.conns.borrow_mut().push(c);
+                    }
+                }
+            }
+            if let Some(s) = &self.udp {
+                let mut buf = [0u8; 64];
+                while let Ok((n, from)) = s.recv_from(&mut buf) {
+                    if &buf[..n] == ASK {
+                        let mut reply = ANSWER.to_vec();
+                        reply.push(self.peers.len() as u8 + 1);
+                        reply.extend_from_slice(self.my_name.as_bytes());
+                        let _ = s.send_to(&reply, from);
+                    }
+                }
+            }
+        }
+        // Поиск комнат: вопрос повторяется, ответы копятся в списке.
+        if self.scan_t > 0.0 {
+            self.scan_ping_t -= dt;
+            if self.scan_ping_t <= 0.0 {
+                self.scan_ping_t = 0.5;
+                self.scan_ping();
+            }
+            if let Some(s) = &self.udp {
+                let mut buf = [0u8; 256];
+                while let Ok((n, from)) = s.recv_from(&mut buf) {
+                    let addr = RoomAddr::Lan(SocketAddr::new(from.ip(), PORT));
+                    if n > ANSWER.len() && buf[..n].starts_with(ANSWER) && !self.lobbies.iter().any(|l| l.addr == addr) {
+                        let name = String::from_utf8_lossy(&buf[ANSWER.len() + 1..n]).into_owned();
+                        self.lobbies.push(LobbyInfo { addr, name: format!("{} - ЛОКАЛЬНАЯ СЕТЬ", name), members: buf[ANSWER.len()] as usize });
+                    }
+                }
+            }
+            self.scan_t -= dt;
+            if self.scan_t <= 0.0 {
+                self.udp = None;
+                if !self.busy && !self.online() {
+                    self.status = format!("НАЙДЕНО КОМНАТ: {}", self.lobbies.len());
+                }
+            }
+        }
+        // Входящие сообщения. Первое в каждом соединении - приветствие с номером игрока.
+        let mut lost = Vec::new();
+        {
+            let mut conns = self.conns.borrow_mut();
+            let mut frames = Vec::new();
+            for i in 0..conns.len() {
+                conns[i].age += dt;
+                frames.clear();
+                conns[i].read(&mut frames);
+                for f in frames.drain(..) {
+                    if conns[i].id != 0 {
+                        msgs.push((conns[i].id, f));
+                        continue;
+                    }
+                    let id = (f.len() == 16 && f.starts_with(MAGIC)).then(|| u64::from_le_bytes(f[8..].try_into().unwrap()));
+                    match id {
+                        Some(id) if id != 0 && id != self.my_id && !conns.iter().any(|c| c.id == id) => {
+                            conns[i].id = id;
+                            if self.mode == Mode::Client && self.host.is_none() {
+                                self.host = Some(id);
+                            }
+                        }
+                        // Не наша игра или другая версия протокола.
+                        _ => conns[i].dead = true,
+                    }
+                }
+                conns[i].flush();
+                // Молчит после соединения или уже не игрок: держать незачем.
+                let stale = if conns[i].id == 0 { conns[i].age > 5.0 } else { self.mode == Mode::Host && conns[i].age > TIMEOUT && !self.peers.iter().any(|p| p.id == conns[i].id) };
+                if stale {
+                    conns[i].dead = true;
+                }
+                if conns[i].dead {
+                    lost.push(conns[i].id);
+                }
+            }
+            conns.retain(|c| !c.dead);
+        }
+        for id in lost {
+            match self.mode {
+                Mode::Host => {
+                    if let Some(i) = self.peers.iter().position(|p| p.id == id) {
+                        let p = self.peers.remove(i);
+                        out.push(NetEvent::Info(format!("{} ОТКЛЮЧИЛСЯ", p.name)));
+                    }
+                }
+                Mode::Client if self.conns.borrow().is_empty() && (self.host.is_none() || self.host == Some(id)) => {
+                    let why = if self.synced { "СВЯЗЬ С ХОСТОМ ПОТЕРЯНА" } else { "НЕ УДАЛОСЬ ВОЙТИ: КОМНАТА ЗАКРЫТА ИЛИ ДРУГАЯ ВЕРСИЯ ИГРЫ" };
+                    self.leave();
+                    out.push(NetEvent::Lost(why.to_string()));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Вызывается каждый кадр: колбэки Steam, прямые соединения, входящие сообщения, таймеры.
+    pub fn poll(&mut self, dt: f32) -> Vec<NetEvent> {
+        let mut out = Vec::new();
+        let mut msgs = Vec::new();
+        self.poll_steam(&mut msgs);
+        self.poll_lan(dt, &mut msgs, &mut out);
+        for (from, data) in msgs {
+            self.handle(from, &data, &mut out);
+        }
+
+        self.cursor_t -= dt;
+        self.state_t -= dt;
+        self.ping_t -= dt;
+        if self.ping_t <= 0.0 {
+            self.ping_t = PING_EVERY;
+            let ping = Wr::new(T_PING).u64(self.now_us()).0;
+            match (self.mode, self.host) {
+                (Mode::Host, _) => self.broadcast(&ping, false),
+                (Mode::Client, Some(h)) if self.synced => self.send(h, &ping, false),
+                _ => {}
+            }
+        }
+        match self.mode {
+            Mode::Host => {
+                for p in &mut self.peers {
+                    p.silence += dt;
+                }
+                let before = self.peers.len();
+                self.peers.retain(|p| p.silence < TIMEOUT);
+                if self.peers.len() != before {
+                    out.push(NetEvent::Info("ИГРОК ОТВАЛИЛСЯ ПО ТАЙМАУТУ".to_string()));
+                }
+                if self.cursor_t <= 0.0 && !self.peers.is_empty() {
+                    self.cursor_t = 0.15;
+                    let mut w = wr_pres(Wr::new(T_CURSORS).u64(self.my_id), &self.cursor).str(&self.my_name);
+                    for p in &self.peers {
+                        w = wr_pres(w.u64(p.id), &p.p).str(&p.name);
+                    }
+                    self.broadcast(&w.0, false);
+                }
+            }
+            Mode::Client => {
+                self.host_silence += dt;
+                if let Some(h) = self.host {
+                    if !self.synced {
+                        self.hello_t -= dt;
+                        if self.hello_t <= 0.0 {
+                            self.hello_t = 1.0;
+                            self.send(h, &Wr::new(T_HELLO).str(&self.my_name).0, true);
+                        }
+                    } else if self.cursor_t <= 0.0 {
+                        self.cursor_t = 0.15;
+                        self.send(h, &wr_pres(Wr::new(T_CURSOR), &self.cursor).0, false);
+                    }
+                }
+                if self.host_silence > TIMEOUT {
+                    self.leave();
+                    out.push(NetEvent::Lost("СВЯЗЬ С ХОСТОМ ПОТЕРЯНА".to_string()));
+                }
+            }
+            Mode::Offline => {}
+        }
+        out
+    }
 }
 
 // ---------- упаковка сообщений ----------
@@ -346,502 +1315,6 @@ fn dec_op(r: &mut Rd) -> Option<Op> {
     })
 }
 
-// ---------- сеть ----------
-
-pub struct Net {
-    client: Option<Client>,
-    rx: Receiver<Ev>,
-    tx: Sender<Ev>,
-    _handles: Vec<CallbackHandle>,
-    pub mode: Mode,
-    pub status: String,
-    pub my_name: String,
-    my_id: u64,
-    lobby: Option<LobbyId>,
-    host: Option<SteamId>,
-    /// Другие игроки (у клиента - по рассылке хоста, включая самого хоста).
-    pub peers: Vec<Peer>,
-    pub lobbies: Vec<LobbyInfo>,
-    pub busy: bool,
-    synced: bool,
-    hello_t: f32,
-    host_silence: f32,
-    cursor: Presence,
-    cursor_t: f32,
-    state_t: f32,
-    clock: std::time::Instant,
-    ping_t: f32,
-    /// Клиенту: пинг до хоста, мс.
-    pub ping_ms: Option<f32>,
-}
-
-impl Net {
-    pub fn new() -> Net {
-        let (tx, rx) = channel();
-        Net {
-            client: None,
-            rx,
-            tx,
-            _handles: Vec::new(),
-            mode: Mode::Offline,
-            status: "НЕ В СЕТИ".to_string(),
-            my_name: String::new(),
-            my_id: 0,
-            lobby: None,
-            host: None,
-            peers: Vec::new(),
-            lobbies: Vec::new(),
-            busy: false,
-            synced: false,
-            hello_t: 0.0,
-            host_silence: 0.0,
-            cursor: Presence::default(),
-            cursor_t: 0.0,
-            state_t: 0.0,
-            clock: std::time::Instant::now(),
-            ping_t: 0.0,
-            ping_ms: None,
-        }
-    }
-
-    /// Подключается к запущенному клиенту Steam (один раз). false - Steam недоступен.
-    pub fn ensure(&mut self) -> bool {
-        if self.client.is_some() {
-            return true;
-        }
-        match Client::init_app(APP_ID) {
-            Ok(client) => {
-                self.my_name = client.friends().name();
-                self.my_id = client.user().steam_id().raw();
-                let tx = self.tx.clone();
-                client.networking_messages().session_request_callback(move |req| {
-                    let _ = tx.send(Ev::Session(req));
-                });
-                let tx = self.tx.clone();
-                self._handles.push(client.register_callback(move |r: GameLobbyJoinRequested| {
-                    let _ = tx.send(Ev::JoinRequested(r.lobby_steam_id));
-                }));
-                self.status = format!("STEAM: {}", self.my_name);
-                self.client = Some(client);
-                true
-            }
-            Err(e) => {
-                self.status = format!("STEAM НЕДОСТУПЕН: {:?}", e).to_uppercase();
-                false
-            }
-        }
-    }
-
-    pub fn online(&self) -> bool {
-        self.mode != Mode::Offline
-    }
-
-    pub fn host_game(&mut self) {
-        if !self.ensure() || self.online() || self.busy {
-            return;
-        }
-        let tx = self.tx.clone();
-        self.busy = true;
-        self.status = "СОЗДАЮ КОМНАТУ...".to_string();
-        self.client.as_ref().unwrap().matchmaking().create_lobby(LobbyType::Public, 8, move |r| {
-            let _ = tx.send(Ev::Created(r.map_err(|e| format!("{:?}", e))));
-        });
-    }
-
-    pub fn refresh(&mut self) {
-        if !self.ensure() || self.busy {
-            return;
-        }
-        let tx = self.tx.clone();
-        self.busy = true;
-        self.status = "ИЩУ КОМНАТЫ...".to_string();
-        let mm = self.client.as_ref().unwrap().matchmaking();
-        mm.add_request_lobby_list_string_filter(StringFilter(LobbyKey::new("game"), LOBBY_TAG, StringFilterKind::Equal));
-        mm.set_request_lobby_list_distance_filter(DistanceFilter::Worldwide);
-        mm.request_lobby_list(move |r| {
-            let _ = tx.send(Ev::List(r.unwrap_or_default()));
-        });
-    }
-
-    pub fn join(&mut self, lobby: LobbyId) {
-        if !self.ensure() || self.busy {
-            return;
-        }
-        if self.online() {
-            self.leave();
-        }
-        let tx = self.tx.clone();
-        self.busy = true;
-        self.status = "ПОДКЛЮЧАЮСЬ...".to_string();
-        self.client.as_ref().unwrap().matchmaking().join_lobby(lobby, move |r| {
-            let _ = tx.send(Ev::Joined(r));
-        });
-    }
-
-    pub fn leave(&mut self) {
-        if let Some(client) = self.client.clone() {
-            let bye = Wr::new(T_BYE).0;
-            match self.mode {
-                Mode::Host => self.broadcast(&bye, true),
-                Mode::Client => {
-                    if let Some(h) = self.host {
-                        self.send(h, &bye, true);
-                    }
-                }
-                Mode::Offline => {}
-            }
-            if let Some(l) = self.lobby.take() {
-                client.matchmaking().leave_lobby(l);
-            }
-        }
-        self.mode = Mode::Offline;
-        self.host = None;
-        self.peers.clear();
-        self.synced = false;
-        self.ping_ms = None;
-        self.status = "НЕ В СЕТИ".to_string();
-    }
-
-    fn send(&self, to: SteamId, data: &[u8], reliable: bool) {
-        if let Some(c) = &self.client {
-            let flags = if reliable { SendFlags::RELIABLE } else { SendFlags::UNRELIABLE }
-                | SendFlags::AUTO_RESTART_BROKEN_SESSION;
-            let _ = c.networking_messages().send_message_to_user(NetworkingIdentity::new_steam_id(to), flags, data, 0);
-        }
-    }
-
-    fn broadcast(&self, data: &[u8], reliable: bool) {
-        for p in &self.peers {
-            self.send(p.id, data, reliable);
-        }
-    }
-
-    pub fn send_cmd(&self, c: &Cmd) {
-        if let (Mode::Client, Some(h)) = (self.mode, self.host) {
-            self.send(h, &enc_cmd(c), true);
-        }
-    }
-
-    pub fn broadcast_op(&self, o: &Op) {
-        if self.mode == Mode::Host {
-            self.broadcast(&enc_op(o), true);
-        }
-    }
-
-    /// Хост: разослать всем новый снимок мира (после нового витка карта пустая).
-    pub fn broadcast_world(&self, text: &str) {
-        if self.mode == Mode::Host {
-            self.broadcast(&Wr::new(T_WORLD).str(text).0, true);
-        }
-    }
-
-    /// Отмечает достижение в Steam, если клиент подключён. В тестовом приложении Spacewar
-    /// наших достижений нет - тогда Steam просто отказывает, игра показывает достижение сама.
-    pub fn achievement(&self, id: &str) -> bool {
-        match &self.client {
-            Some(c) => {
-                let stats = c.user_stats();
-                stats.achievement(id).set().is_ok() && stats.store_stats().is_ok()
-            }
-            None => false,
-        }
-    }
-
-    pub fn send_world(&self, to: SteamId, text: &str) {
-        self.send(to, &Wr::new(T_WORLD).str(text).0, true);
-    }
-
-    /// Хосту: пора ли разослать состояние экономики (3 раза в секунду).
-    pub fn state_due(&mut self) -> bool {
-        if self.mode == Mode::Host && !self.peers.is_empty() && self.state_t <= 0.0 {
-            self.state_t = 0.33;
-            return true;
-        }
-        false
-    }
-
-    pub fn broadcast_state(&self, s: &StateMsg) {
-        self.broadcast(&enc_state(s), true);
-    }
-
-    pub fn broadcast_logic(&self, ticks: u64, st: &[(bool, u32, bool)]) {
-        if !st.is_empty() {
-            self.broadcast(&enc_logic(ticks, st), true);
-        }
-    }
-
-    /// Подставной игрок для скриншота-самопроверки (в сеть ничего не уходит).
-    pub fn fake_peer(&mut self, id: u64, name: &str, p: Presence) {
-        self.peers.push(Peer { id: SteamId::from_raw(id), name: name.to_string(), p, silence: 0.0, ping_ms: None });
-    }
-
-    /// Пинг для счётчика: клиенту - до хоста, хосту - до самого медленного игрока.
-    pub fn ping(&self) -> Option<f32> {
-        match self.mode {
-            Mode::Client => self.ping_ms,
-            Mode::Host => self.peers.iter().filter_map(|p| p.ping_ms).reduce(f32::max),
-            Mode::Offline => None,
-        }
-    }
-
-    fn now_us(&self) -> u64 {
-        self.clock.elapsed().as_micros() as u64
-    }
-
-    pub fn set_presence(&mut self, p: Presence) {
-        self.cursor = p;
-    }
-
-    fn handle(&mut self, from: SteamId, data: &[u8], out: &mut Vec<NetEvent>) {
-        let mut r = Rd(data);
-        let tag = match r.u8() {
-            Some(t) => t,
-            None => return,
-        };
-        // Пинг одинаков у хоста и клиента: на T_PING отвечаем сразу, по T_PONG считаем задержку.
-        let known = match self.mode {
-            Mode::Host => self.peers.iter().any(|p| p.id == from),
-            Mode::Client => Some(from) == self.host,
-            Mode::Offline => false,
-        };
-        if known && (tag == T_PING || tag == T_PONG) {
-            if let Some(t) = r.u64() {
-                if tag == T_PING {
-                    self.send(from, &Wr::new(T_PONG).u64(t).0, false);
-                } else {
-                    let rtt = self.now_us().saturating_sub(t) as f32 / 1000.0;
-                    match self.mode {
-                        Mode::Host => {
-                            if let Some(p) = self.peers.iter_mut().find(|p| p.id == from) {
-                                p.ping_ms = Some(smooth_ping(p.ping_ms, rtt));
-                            }
-                        }
-                        _ => self.ping_ms = Some(smooth_ping(self.ping_ms, rtt)),
-                    }
-                }
-            }
-            return;
-        }
-        match self.mode {
-            Mode::Host => {
-                if tag == T_HELLO {
-                    let name = r.str().unwrap_or_default();
-                    if let Some(p) = self.peers.iter_mut().find(|p| p.id == from) {
-                        p.silence = 0.0;
-                    } else if self.peers.len() < 7 {
-                        self.peers.push(Peer { id: from, name: name.clone(), p: Presence::default(), silence: 0.0, ping_ms: None });
-                        out.push(NetEvent::Info(format!("{} ПОДКЛЮЧИЛСЯ", name)));
-                    } else {
-                        return;
-                    }
-                    out.push(NetEvent::Hello(from, name));
-                    return;
-                }
-                let idx = match self.peers.iter().position(|p| p.id == from) {
-                    Some(i) => i,
-                    None => return,
-                };
-                self.peers[idx].silence = 0.0;
-                match tag {
-                    T_CMD => {
-                        if let Some(c) = dec_cmd(&mut r) {
-                            out.push(NetEvent::Cmd(c));
-                        }
-                    }
-                    T_CURSOR => {
-                        if let Some(p) = rd_pres(&mut r) {
-                            self.peers[idx].p = p;
-                        }
-                    }
-                    T_BYE => {
-                        let p = self.peers.remove(idx);
-                        out.push(NetEvent::Info(format!("{} ОТКЛЮЧИЛСЯ", p.name)));
-                    }
-                    _ => {}
-                }
-            }
-            Mode::Client => {
-                if Some(from) != self.host {
-                    return;
-                }
-                self.host_silence = 0.0;
-                match tag {
-                    T_WORLD => {
-                        if let Some(s) = r.str() {
-                            self.synced = true;
-                            self.status = "В ЧУЖОЙ КОМНАТЕ".to_string();
-                            out.push(NetEvent::World(s));
-                        }
-                    }
-                    T_OP if self.synced => {
-                        if let Some(o) = dec_op(&mut r) {
-                            out.push(NetEvent::Op(o));
-                        }
-                    }
-                    T_STATE if self.synced => {
-                        if let Some(st) = dec_state(&mut r) {
-                            out.push(NetEvent::State(st));
-                        }
-                    }
-                    T_LOGIC if self.synced => {
-                        if let Some((ticks, st)) = dec_logic(&mut r) {
-                            out.push(NetEvent::Logic(ticks, st));
-                        }
-                    }
-                    T_CURSORS => {
-                        self.peers.clear();
-                        while let (Some(id), Some(p), Some(name)) = (r.u64(), rd_pres(&mut r), r.str()) {
-                            if id != self.my_id && self.peers.len() < 8 {
-                                self.peers.push(Peer { id: SteamId::from_raw(id), name, p, silence: 0.0, ping_ms: None });
-                            }
-                        }
-                    }
-                    T_BYE => {
-                        self.leave();
-                        out.push(NetEvent::Lost("ХОСТ ЗАКРЫЛ КОМНАТУ".to_string()));
-                    }
-                    _ => {}
-                }
-            }
-            Mode::Offline => {}
-        }
-    }
-
-    /// Вызывается каждый кадр: колбэки Steam, входящие сообщения, таймеры.
-    pub fn poll(&mut self, dt: f32) -> Vec<NetEvent> {
-        let mut out = Vec::new();
-        let client = match self.client.clone() {
-            Some(c) => c,
-            None => return out,
-        };
-        client.run_callbacks();
-        let mm = client.matchmaking();
-        while let Ok(ev) = self.rx.try_recv() {
-            match ev {
-                Ev::Created(Ok(l)) => {
-                    self.busy = false;
-                    mm.set_lobby_data(l, "game", LOBBY_TAG);
-                    mm.set_lobby_data(l, "name", &self.my_name);
-                    self.lobby = Some(l);
-                    self.mode = Mode::Host;
-                    self.peers.clear();
-                    self.status = "ТЫ ХОСТ. КОМНАТА ОТКРЫТА".to_string();
-                }
-                Ev::Created(Err(e)) => {
-                    self.busy = false;
-                    self.status = format!("НЕ УДАЛОСЬ СОЗДАТЬ: {}", e).to_uppercase();
-                }
-                Ev::Joined(Ok(l)) => {
-                    self.busy = false;
-                    self.lobby = Some(l);
-                    self.host = Some(mm.lobby_owner(l));
-                    self.mode = Mode::Client;
-                    self.synced = false;
-                    self.hello_t = 0.0;
-                    self.host_silence = 0.0;
-                    self.peers.clear();
-                    self.status = "ЖДУ МИР ОТ ХОСТА...".to_string();
-                }
-                Ev::Joined(Err(())) => {
-                    self.busy = false;
-                    self.status = "НЕ УДАЛОСЬ ВОЙТИ В КОМНАТУ".to_string();
-                }
-                Ev::List(ids) => {
-                    self.busy = false;
-                    self.lobbies = ids
-                        .into_iter()
-                        .take(8)
-                        .map(|id| LobbyInfo {
-                            id,
-                            name: mm.lobby_data(id, "name").unwrap_or_else(|| "?".to_string()),
-                            members: mm.lobby_member_count(id),
-                        })
-                        .collect();
-                    self.status = format!("НАЙДЕНО КОМНАТ: {}", self.lobbies.len());
-                }
-                Ev::JoinRequested(l) => self.join(l),
-                Ev::Session(req) => {
-                    // Принимаем соединения только от участников нашей комнаты.
-                    let known = match (self.lobby, req.remote().steam_id()) {
-                        (Some(l), Some(id)) => mm.lobby_members(l).contains(&id),
-                        _ => false,
-                    };
-                    if known {
-                        req.accept();
-                    }
-                }
-            }
-        }
-
-        let nm = client.networking_messages();
-        for _ in 0..8 {
-            let msgs = nm.receive_messages_on_channel(0, 64);
-            if msgs.is_empty() {
-                break;
-            }
-            for m in msgs {
-                if let Some(from) = m.identity_peer().steam_id() {
-                    let data = m.data().to_vec();
-                    self.handle(from, &data, &mut out);
-                }
-            }
-        }
-
-        self.cursor_t -= dt;
-        self.state_t -= dt;
-        self.ping_t -= dt;
-        if self.ping_t <= 0.0 {
-            self.ping_t = PING_EVERY;
-            let ping = Wr::new(T_PING).u64(self.now_us()).0;
-            match (self.mode, self.host) {
-                (Mode::Host, _) => self.broadcast(&ping, false),
-                (Mode::Client, Some(h)) if self.synced => self.send(h, &ping, false),
-                _ => {}
-            }
-        }
-        match self.mode {
-            Mode::Host => {
-                for p in &mut self.peers {
-                    p.silence += dt;
-                }
-                let before = self.peers.len();
-                self.peers.retain(|p| p.silence < TIMEOUT);
-                if self.peers.len() != before {
-                    out.push(NetEvent::Info("ИГРОК ОТВАЛИЛСЯ ПО ТАЙМАУТУ".to_string()));
-                }
-                if self.cursor_t <= 0.0 && !self.peers.is_empty() {
-                    self.cursor_t = 0.15;
-                    let mut w = wr_pres(Wr::new(T_CURSORS).u64(self.my_id), &self.cursor).str(&self.my_name);
-                    for p in &self.peers {
-                        w = wr_pres(w.u64(p.id.raw()), &p.p).str(&p.name);
-                    }
-                    self.broadcast(&w.0, false);
-                }
-            }
-            Mode::Client => {
-                self.host_silence += dt;
-                if let Some(h) = self.host {
-                    if !self.synced {
-                        self.hello_t -= dt;
-                        if self.hello_t <= 0.0 {
-                            self.hello_t = 1.0;
-                            self.send(h, &Wr::new(T_HELLO).str(&self.my_name).0, true);
-                        }
-                    } else if self.cursor_t <= 0.0 {
-                        self.cursor_t = 0.15;
-                        self.send(h, &wr_pres(Wr::new(T_CURSOR), &self.cursor).0, false);
-                    }
-                }
-                if self.host_silence > TIMEOUT {
-                    self.leave();
-                    out.push(NetEvent::Lost("СВЯЗЬ С ХОСТОМ ПОТЕРЯНА".to_string()));
-                }
-            }
-            Mode::Offline => {}
-        }
-        out
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -858,9 +1331,9 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(30));
         let pong = Wr::new(T_PONG).u64(0).0;
         let mut out = Vec::new();
-        net.handle(SteamId::from_raw(99), &pong, &mut out);
+        net.handle(99, &pong, &mut out);
         assert_eq!(net.ping(), None);
-        net.handle(SteamId::from_raw(5), &pong, &mut out);
+        net.handle(5, &pong, &mut out);
         let p = net.ping().expect("пинг посчитан");
         assert!(p >= 30.0 && p < 5000.0, "пинг {}", p);
         assert!(out.is_empty());
@@ -905,12 +1378,12 @@ mod tests {
         client.replica = true;
         let mut net = Net::new();
         net.mode = Mode::Client;
-        net.host = Some(SteamId::from_raw(1));
+        net.host = Some(1);
         net.synced = true;
         // Внеочередная рассылка логики: хост шлёт её, когда сработал датчик (не чаще 10 раз в секунду).
         let push_logic = |host: &World, client: &mut World, net: &mut Net| {
             let mut evs = Vec::new();
-            net.handle(SteamId::from_raw(1), &enc_logic(host.logic_ticks, &host.logic_state()), &mut evs);
+            net.handle(1, &enc_logic(host.logic_ticks, &host.logic_state()), &mut evs);
             match evs.pop() {
                 Some(NetEvent::Logic(t, st)) => client.apply_logic_state(t, &st),
                 _ => panic!("состояние логики не разобрано"),
@@ -928,8 +1401,8 @@ mod tests {
                 extra: host.econ_save(),
             };
             let mut evs = Vec::new();
-            net.handle(SteamId::from_raw(1), &enc_state(&st), &mut evs);
-            net.handle(SteamId::from_raw(1), &enc_logic(host.logic_ticks, &host.logic_state()), &mut evs);
+            net.handle(1, &enc_state(&st), &mut evs);
+            net.handle(1, &enc_logic(host.logic_ticks, &host.logic_state()), &mut evs);
             assert_eq!(evs.len(), 2, "оба сообщения разобраны");
             for ev in evs {
                 match ev {

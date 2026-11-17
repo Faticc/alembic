@@ -7,6 +7,9 @@ use crate::engine::*;
 use crate::net::{Cmd, Mode, Net, NetEvent, Op, Presence, StateMsg};
 use crate::world::*;
 
+mod pad;
+mod touch;
+
 const TOP_H: i32 = 44;
 const BAR_H: i32 = 88;
 const PANEL: Color = 0xF02B_2433;
@@ -17,8 +20,11 @@ const DIM: Color = hex(0x9A93A8);
 const GREEN: Color = hex(0x7ED67A);
 const RED: Color = hex(0xE8553A);
 pub const SAVE_FILE: &str = "alembic_save.txt";
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Как часто хост рассылает состояние логики вне очереди, когда срабатывают датчики.
 const LOGIC_PUSH: f32 = 0.1;
+/// Сколько комнат помещается в окне сетевой игры.
+const NET_ROWS: usize = 5;
 
 pub fn fmt_money(v: f64) -> String {
     if v < 10_000.0 {
@@ -254,6 +260,11 @@ pub struct Game {
     logic_t: f32,
     pub pasting: bool,
     pub net: Net,
+    /// Сенсорное управление (телефон или ключ --touch) и его состояние.
+    pub touch: touch::Touch,
+    pub pad: pad::PadState,
+    /// Адрес комнаты, набираемый в окне сетевой игры.
+    pub ip_text: String,
     pub persist: bool,
     drag_tile: Option<(i32, i32)>,
     rdrag_tile: Option<(i32, i32)>,
@@ -385,6 +396,9 @@ impl Game {
             logic_t: 0.0,
             pasting: false,
             net: Net::new(),
+            touch: touch::Touch::default(),
+            pad: pad::PadState::default(),
+            ip_text: String::new(),
             persist: true,
             drag_tile: None,
             rdrag_tile: None,
@@ -730,7 +744,17 @@ impl Game {
         let (tw, gap) = (124, 4);
         let n = TAB_NAMES.len() as i32;
         let x0 = (self.w - (n * tw + (n - 1) * gap)) / 2;
-        (x0 + i as i32 * (tw + gap), self.h - BAR_H - 28, tw, 24)
+        let th = self.tab_h();
+        (x0 + i as i32 * (tw + gap), self.h - BAR_H - 4 - th, tw, th)
+    }
+
+    /// Высота вкладок: под палец они выше.
+    fn tab_h(&self) -> i32 {
+        if self.touch.on {
+            40
+        } else {
+            24
+        }
     }
 
     fn upgrade_rect(&self, i: usize) -> (i32, i32, i32, i32) {
@@ -1253,16 +1277,24 @@ impl Game {
     /// Щелчок по середине постройки с настройками открывает её окно.
     fn click_port(&mut self, mx: i32, my: i32) {
         let ((x, y), d) = self.side_at(mx, my);
-        let (facing, old_cfg) = match self.world.get(x, y) {
-            Some(b) => (b.dir, b.cfg),
-            None => return,
-        };
+        if self.world.get(x, y).is_none() {
+            return;
+        }
         let (ox, oy) = self.origin();
         let ts = self.ts();
         let (cx, cy) = (mx - (ox + x * ts) - ts / 2, my - (oy + y * ts) - ts / 2);
         if cx.abs().max(cy.abs()) <= ts / 5 && self.open_cfg(x, y) {
             return;
         }
+        self.cycle_side(x, y, d);
+    }
+
+    /// Переключает сторону машины: авто -> вход -> выход -> закрыто (-> отказ) -> авто.
+    pub(super) fn cycle_side(&mut self, x: i32, y: i32, d: Dir) {
+        let (facing, old_cfg) = match self.world.get(x, y) {
+            Some(b) => (b.dir, b.cfg),
+            None => return,
+        };
         let rel = rel_side(facing, d);
         if let Some((packed, cfg)) = self.world.next_side(x, y, rel) {
             self.apply_ports(x, y, packed);
@@ -1929,17 +1961,34 @@ let rate = format!("КРОЛИЧЬЯ НОРА: ВСЁ, ЧТО ВОШЛО В ПЕ
     }
 
     fn net_panel(&self) -> (i32, i32, i32, i32) {
-        ((self.w - 600) / 2, (self.h - 420) / 2, 600, 420)
+        ((self.w - 600) / 2, (self.h - 540) / 2, 600, 540)
     }
 
     fn net_button(&self, i: i32) -> (i32, i32, i32, i32) {
         let p = self.net_panel();
-        (p.0 + 20 + i * 285, p.1 + 84, 275, 34)
+        (p.0 + 20 + i * 285, p.1 + 80, 275, 44)
     }
 
     fn net_row(&self, i: usize) -> (i32, i32, i32, i32) {
         let p = self.net_panel();
-        (p.0 + 20, p.1 + 162 + i as i32 * 28, 560, 26)
+        (p.0 + 20, p.1 + 222 + i as i32 * 40, 560, 36)
+    }
+
+    fn net_ip_rect(&self) -> (i32, i32, i32, i32) {
+        let p = self.net_panel();
+        (p.0 + 110, p.1 + 136, 300, 44)
+    }
+
+    fn net_ip_btn(&self) -> (i32, i32, i32, i32) {
+        let r = self.net_ip_rect();
+        (r.0 + r.2 + 10, r.1, 140, 44)
+    }
+
+    fn join_typed_ip(&mut self) {
+        let text = self.ip_text.clone();
+        if !self.net.join_ip(&text) {
+            self.audio.play(150.0, 0.14, 0.12, Wave::Square, 0.0);
+        }
     }
 
     fn click_net(&mut self, mx: i32, my: i32) {
@@ -1955,10 +2004,12 @@ let rate = format!("КРОЛИЧЬЯ НОРА: ВСЁ, ЧТО ВОШЛО В ПЕ
                     self.net.host_game();
                 } else if b1 {
                     self.net.refresh();
+                } else if inside(self.net_ip_btn(), mx, my) {
+                    self.join_typed_ip();
                 } else {
-                    let hit = (0..self.net.lobbies.len()).find(|i| inside(self.net_row(*i), mx, my));
+                    let hit = (0..self.net.lobbies.len().min(NET_ROWS)).find(|i| inside(self.net_row(*i), mx, my));
                     if let Some(i) = hit {
-                        let id = self.net.lobbies[i].id;
+                        let id = self.net.lobbies[i].addr;
                         self.net.join(id);
                     }
                 }
@@ -1975,6 +2026,16 @@ let rate = format!("КРОЛИЧЬЯ НОРА: ВСЁ, ЧТО ВОШЛО В ПЕ
     pub fn update(&mut self, inp: &Input, dt: f32, w: i32, h: i32) {
         self.w = w;
         self.h = h;
+        let adapted;
+        let padded = self.pad_adapt(inp, dt);
+        let inp = if let Some(p) = padded.as_ref() {
+            p
+        } else if self.touch.on {
+            adapted = self.touch_adapt(inp);
+            &adapted
+        } else {
+            inp
+        };
         self.mx = inp.mx;
         self.my = inp.my;
         self.time += dt;
@@ -1996,7 +2057,26 @@ let rate = format!("КРОЛИЧЬЯ НОРА: ВСЁ, ЧТО ВОШЛО В ПЕ
                 self.bp_scroll = (self.bp_scroll as i32 - inp.wheel.signum() as i32).clamp(0, max as i32) as usize;
             }
         }
+        if self.show_net {
+            for ch in &inp.typed {
+                if (ch.is_ascii_digit() || *ch == '.' || *ch == ':') && self.ip_text.len() < 21 {
+                    self.ip_text.push(*ch);
+                }
+            }
+        }
         for k in &inp.pressed {
+            if self.show_net {
+                match k {
+                    Key::Escape | Key::F2 => self.close_modals(),
+                    Key::Enter | Key::NumPadEnter if self.net.mode == Mode::Offline => self.join_typed_ip(),
+                    Key::Backspace => {
+                        self.ip_text.pop();
+                    }
+                    Key::F11 => self.toggle_fullscreen = true,
+                    _ => {}
+                }
+                continue;
+            }
             if self.show_bp {
                 match k {
                     Key::Escape => self.close_modals(),
@@ -2216,7 +2296,7 @@ let rate = format!("КРОЛИЧЬЯ НОРА: ВСЁ, ЧТО ВОШЛО В ПЕ
             self.click_at = Some((inp.mx, inp.my));
         }
         if let Some((cx, cy)) = self.click_at {
-            if (inp.mx - cx).abs() + (inp.my - cy).abs() > 6 || !free {
+            if (inp.mx - cx).abs() + (inp.my - cy).abs() > self.touch.slop() || !free {
                 self.click_at = None;
             } else if !inp.lmb {
                 self.click_at = None;
@@ -2446,6 +2526,10 @@ let rate = format!("КРОЛИЧЬЯ НОРА: ВСЁ, ЧТО ВОШЛО В ПЕ
         } else if self.show_bp {
             self.draw_bp(c);
         }
+        if self.touch.on && !self.pad.active {
+            self.draw_touch(c);
+        }
+        self.draw_pad(c);
     }
 
     fn draw_world(&self, c: &mut Image) {
@@ -2844,7 +2928,7 @@ let rate = format!("КРОЛИЧЬЯ НОРА: ВСЁ, ЧТО ВОШЛО В ПЕ
 
         // Другие игроки: курсор, постройка в руках, рамка выделения или вставки.
         for p in &self.net.peers {
-            let col = [hex(0x58B4F0), hex(0xF07AD8), hex(0x7ED67A), hex(0xFFB03A)][(p.id.raw() % 4) as usize];
+            let col = [hex(0x58B4F0), hex(0xF07AD8), hex(0x7ED67A), hex(0xFFB03A)][(p.id % 4) as usize];
             let pr = &p.p;
             // Игрок на другом слое карты здесь не виден.
             if layer_of(pr.y) != self.layer {
@@ -2903,7 +2987,7 @@ let rate = format!("КРОЛИЧЬЯ НОРА: ВСЁ, ЧТО ВОШЛО В ПЕ
         x = c.text(x + bw + 14, 15, &format!("+${}", fmt_money(ct.reward * w.reward_mult())), 2, GOLD);
         let help = "F2 - СЕТЬ  C - КАТАЛОГ  T - СТАТИСТИКА  F1 - ПОМОЩЬ";
         let hx = c.w - text_w(help, 2) - 14;
-        if hx > x + 20 {
+        if hx > x + 20 && !self.touch.on {
             c.text(hx, 15, help, 2, DIM);
         }
 
@@ -2965,7 +3049,7 @@ let rate = format!("КРОЛИЧЬЯ НОРА: ВСЁ, ЧТО ВОШЛО В ПЕ
             c.fill_rect(r.0, r.1, r.2, r.3, if sel || hov { 0xF04A_4058 } else { PANEL });
             c.rect_outline(r.0, r.1, r.2, r.3, 2, if sel { GOLD } else { PANEL_HI });
             let col = if sel { GOLD } else { DIM };
-            c.text(r.0 + (r.2 - text_w(name, 2)) / 2, r.1 + 5, name, 2, col);
+            c.text(r.0 + (r.2 - text_w(name, 2)) / 2, r.1 + (r.3 - 14) / 2, name, 2, col);
         }
 
         // Панель построек текущей вкладки.
@@ -2995,19 +3079,22 @@ let rate = format!("КРОЛИЧЬЯ НОРА: ВСЁ, ЧТО ВОШЛО В ПЕ
         }
 
         // Подсказка / сообщение над вкладками.
-        let line_y = self.h - BAR_H - 28 - 30;
+        let line_y = self.h - BAR_H - 4 - self.tab_h() - 30;
         let hint: Option<(String, Color)> = if let Some((msg, t)) = &self.toast {
             Some((msg.clone(), with_alpha(hex(0xFFD9A0), (255.0 * t.min(1.0)) as u8)))
         } else if let Some(t) = &tip {
             Some((t.clone(), TEXT))
         } else if self.pasting {
             let cost = fmt_money(self.clip_cost());
-            Some((format!("ВСТАВКА (${}): ЛКМ - ПОСТАВИТЬ, R - ПОВЕРНУТЬ, ПКМ - ВЫХОД", cost), TEXT))
+            let how = if self.touch.on { "ВЕДИ ПАЛЬЦЕМ И ОТПУСТИ, ДВА ПАЛЬЦА - КАМЕРА" } else { "ЛКМ - ПОСТАВИТЬ, R - ПОВЕРНУТЬ, ПКМ - ВЫХОД" };
+            Some((format!("ВСТАВКА (${}): {}", cost, how), TEXT))
         } else if self.sel.is_some() {
             let n = self.selected().len() + self.selected_nodes().len();
-            Some((format!("ВЫДЕЛЕНО {}: DEL - СНЕСТИ, CTRL+C - КОПИЯ, CTRL+X - ПЕРЕНОС", n), TEXT))
+            let how = if self.touch.on { "ДЕЙСТВИЯ - КНОПКИ СПРАВА ВНИЗУ" } else { "DEL - СНЕСТИ, CTRL+C - КОПИЯ, CTRL+X - ПЕРЕНОС" };
+            Some((format!("ВЫДЕЛЕНО {}: {}", n, how), TEXT))
         } else {
-            self.tool.map(|k| (format!("{}: ЛКМ - СТРОИТЬ, R - ПОВЕРНУТЬ, ПКМ - ОТМЕНА", k.name()), DIM))
+            let how = if self.touch.on { "КАСАНИЕ - СТРОИТЬ, ДВА ПАЛЬЦА - КАМЕРА" } else { "ЛКМ - СТРОИТЬ, R - ПОВЕРНУТЬ, ПКМ - ОТМЕНА" };
+            self.tool.map(|k| (format!("{}: {}", k.name(), how), DIM))
         };
         if let Some((msg, col)) = hint {
             // Длинная подсказка печатается мельче, чтобы не уезжать за края окна.
@@ -3442,38 +3529,49 @@ let rate = format!("КРОЛИЧЬЯ НОРА: ВСЁ, ЧТО ВОШЛО В ПЕ
         c.fill_rect(0, 0, c.w, c.h, 0xA010_0E16);
         let p = self.net_panel();
         panel(c, p, GOLD);
-        c.text(p.0 + 20, p.1 + 18, "СЕТЕВАЯ ИГРА ЧЕРЕЗ STEAM", 2, GOLD);
-        let ver = format!("ВЕРСИЯ {}", crate::update::VERSION);
+        c.text(p.0 + 20, p.1 + 18, "СЕТЕВАЯ ИГРА", 2, GOLD);
+        let ver = format!("ВЕРСИЯ {}", VERSION);
         c.text(p.0 + p.2 - 20 - text_w(&ver, 2), p.1 + 18, &ver, 2, DIM);
-        c.text(p.0 + 20, p.1 + 48, &self.net.status, 2, if self.net.online() { GREEN } else { TEXT });
+        let sc = if text_w(&self.net.status, 2) > p.2 - 40 { 1 } else { 2 };
+        c.text(p.0 + 20, p.1 + 48 + (2 - sc) * 4, &self.net.status, sc, if self.net.online() { GREEN } else { TEXT });
         let button = |c: &mut Image, r: (i32, i32, i32, i32), label: &str| {
             let hov = inside(r, self.mx, self.my);
             c.fill_rect(r.0, r.1, r.2, r.3, if hov { hex(0x5A4E6C) } else { hex(0x3A3346) });
             c.rect_outline(r.0, r.1, r.2, r.3, 2, GOLD);
-            c.text(r.0 + (r.2 - text_w(label, 2)) / 2, r.1 + 10, label, 2, TEXT);
+            c.text(r.0 + (r.2 - text_w(label, 2)) / 2, r.1 + (r.3 - 14) / 2, label, 2, TEXT);
         };
         match self.net.mode {
             Mode::Offline => {
                 button(c, self.net_button(0), "СОЗДАТЬ КОМНАТУ");
                 button(c, self.net_button(1), "НАЙТИ КОМНАТЫ");
-                c.text(p.0 + 20, p.1 + 136, "КОМНАТЫ (ЩЁЛКНИ, ЧТОБЫ ВОЙТИ):", 2, DIM);
-                for (i, l) in self.net.lobbies.iter().enumerate() {
+                // Вход по адресу: для телефона и для игры без Steam.
+                let r = self.net_ip_rect();
+                c.text(p.0 + 20, r.1 + 15, "ПО IP:", 2, DIM);
+                c.fill_rect(r.0, r.1, r.2, r.3, hex(0x14121A));
+                c.rect_outline(r.0, r.1, r.2, r.3, 2, PANEL_HI);
+                let x = c.text(r.0 + 10, r.1 + 15, &self.ip_text, 2, TEXT);
+                if (self.time * 2.0) as i32 % 2 == 0 {
+                    c.fill_rect(x + 2, r.1 + 13, 3, 18, TEXT);
+                }
+                button(c, self.net_ip_btn(), "ВОЙТИ");
+                c.text(p.0 + 20, p.1 + 198, "КОМНАТЫ (НАЖМИ, ЧТОБЫ ВОЙТИ):", 2, DIM);
+                for (i, l) in self.net.lobbies.iter().enumerate().take(NET_ROWS) {
                     let r = self.net_row(i);
                     let hov = inside(r, self.mx, self.my);
                     c.fill_rect(r.0, r.1, r.2, r.3, if hov { hex(0x5A4E6C) } else { hex(0x3A3346) });
-                    c.text(r.0 + 8, r.1 + 6, &format!("{}  ({} ИГР.)", l.name, l.members), 2, TEXT);
+                    c.text(r.0 + 8, r.1 + 11, &format!("{}  ({} ИГР.)", l.name, l.members), 2, TEXT);
                 }
             }
             Mode::Host | Mode::Client => {
                 let label = if self.net.mode == Mode::Host { "ЗАКРЫТЬ КОМНАТУ" } else { "ВЫЙТИ ИЗ КОМНАТЫ" };
                 button(c, self.net_button(0), label);
-                c.text(p.0 + 20, p.1 + 136, "ИГРОКИ:", 2, DIM);
-                let x = c.text(p.0 + 20, p.1 + 166, &format!("{} (ТЫ)", self.net.my_name), 2, TEXT);
+                c.text(p.0 + 20, p.1 + 146, "ИГРОКИ:", 2, DIM);
+                let x = c.text(p.0 + 20, p.1 + 176, &format!("{} (ТЫ)", self.net.my_name), 2, TEXT);
                 if let (Mode::Client, Some(ms)) = (self.net.mode, self.net.ping_ms) {
-                    c.text(x + 20, p.1 + 166, &format!("ПИНГ ДО ХОСТА {:.0} МС", ms), 2, ping_color(ms));
+                    c.text(x + 20, p.1 + 176, &format!("ПИНГ ДО ХОСТА {:.0} МС", ms), 2, ping_color(ms));
                 }
                 for (i, pl) in self.net.peers.iter().enumerate() {
-                    let y = p.1 + 194 + i as i32 * 28;
+                    let y = p.1 + 204 + i as i32 * 28;
                     let x = c.text(p.0 + 20, y, &pl.name, 2, TEXT);
                     if let Some(ms) = pl.ping_ms {
                         c.text(x + 20, y, &format!("{:.0} МС", ms), 2, ping_color(ms));
@@ -3482,8 +3580,8 @@ let rate = format!("КРОЛИЧЬЯ НОРА: ВСЁ, ЧТО ВОШЛО В ПЕ
             }
         }
         let foot = [
-            "НУЖЕН STEAM. ТАМ ИГРА ВИДНА КАК SPACEWAR.",
-            "ДРУГ: F2, НАЙТИ КОМНАТЫ, ЩЕЛЧОК ПО КОМНАТЕ.",
+            "ПК: STEAM (ИГРА ВИДНА КАК SPACEWAR) ИЛИ СЕТЬ.",
+            "ТЕЛЕФОН: ТОТ ЖЕ WI-FI ИЛИ IP ХОСТА.",
             "МИР, ДЕНЬГИ И КОНТРАКТЫ - ОБЩИЕ, ОТ ХОСТА.",
         ];
         for (i, l) in foot.iter().enumerate() {
@@ -3509,14 +3607,46 @@ let rate = format!("КРОЛИЧЬЯ НОРА: ВСЁ, ЧТО ВОШЛО В ПЕ
         // Пинг - строкой выше, чтобы плашка не залезала под панель построек.
         let rows = 1 + ping.is_some() as i32;
         let tw = text_w(&s, 2).max(ping.as_ref().map_or(0, |p| text_w(&p.0, 2)));
-        c.fill_rect(8, c.h - 8 - 28 * rows, tw + 16, 28 * rows, 0xE02B_2433);
-        c.text(16, c.h - 29, &s, 2, col);
+        // На сенсорном экране левый нижний угол занят кнопками: счётчик встаёт над ними.
+        let h = if self.touch.on { c.h - self.touch_left_rows() * 62 } else { c.h };
+        c.fill_rect(8, h - 8 - 28 * rows, tw + 16, 28 * rows, 0xE02B_2433);
+        c.text(16, h - 29, &s, 2, col);
         if let Some((p, pc)) = ping {
-            c.text(16, c.h - 57, &p, 2, pc);
+            c.text(16, h - 57, &p, 2, pc);
         }
     }
 
     fn draw_help(&self, c: &mut Image) {
+        let touch_lines = [
+            "ALEMBIC - АЛХИМИЧЕСКИЙ ТАЙКУН",
+            "",
+            "КАЧАЙ ЭССЕНЦИИ СТИХИЙ ИЗ ЖИЛ, ВЕЗИ ИХ КОНВЕЙЕРАМИ",
+            "В ЛАВКУ В ЦЕНТРЕ КАРТЫ И ПРОДАВАЙ. СМЕШИВАЙ, ОЧИЩАЙ",
+            "И ПЕРЕРАБАТЫВАЙ - СЛОЖНЫЕ ТОВАРЫ СТОЯТ НАМНОГО ДОРОЖЕ.",
+            "ВЫПОЛНЯЙ КОНТРАКТЫ, ЧТОБЫ ОТКРЫВАТЬ НОВЫЕ МАШИНЫ.",
+            "",
+            "ОДИН ПАЛЕЦ     ДВИГАТЬ КАМЕРУ, ПОКА НИЧЕГО НЕ ВЫБРАНО",
+            "ДВА ПАЛЬЦА     КАМЕРА И МАСШТАБ В ЛЮБОЙ МОМЕНТ",
+            "ПАНЕЛЬ ВНИЗУ   ВЫБРАТЬ ПОСТРОЙКУ; КАСАНИЕ - ПОСТАВИТЬ",
+            "ВЕСТИ ПАЛЬЦЕМ  ТЯНУТЬ КОНВЕЙЕР, ОН ПОВОРАЧИВАЕТСЯ САМ",
+            "ПОВОРОТ        ПОВЕРНУТЬ ПОСТРОЙКУ ПЕРЕД УСТАНОВКОЙ",
+            "ОТМЕНА         УБРАТЬ ПОСТРОЙКУ ИЗ РУК, ВЫЙТИ ИЗ РЕЖИМА",
+            "СНОС           ВЕСТИ ПАЛЬЦЕМ - СНОСИТЬ (ДЕНЬГИ ВЕРНУТСЯ)",
+            "РАМКА          ВЫДЕЛИТЬ: КОПИЯ, ПЕРЕНОС, УДАЛИТЬ",
+            "КАСАНИЕ МАШИНЫ ВЫБРАТЬ ЕЁ: СВЕДЕНИЯ И КНОПКИ ДЕЙСТВИЙ",
+            "ЕЩЁ КАСАНИЕ    ПО КРАЮ - СТОРОНА: ВХОД / ВЫХОД / ЗАКРЫТО,",
+            "               ПО ЦЕНТРУ - ОКНО НАСТРОЕК",
+            "ВНИЗ / НАВЕРХ  ПОДЗЕМЕЛЬЕ И ПОВЕРХНОСТЬ (СВЯЗЬ - ЛИФТЫ)",
+            "ПРОВОДА        СЛОЙ ЛОГИКИ",
+            "МЕНЮ           КАТАЛОГ, СТАТИСТИКА, ГИЛЬДИИ, ВИТРАЖ,",
+            "               ЧЕРТЕЖИ, СЕТЕВАЯ ИГРА, ЗВУК, ЭТА СПРАВКА",
+            "",
+            "МАШИНЫ БЕРУТ СЫРЬЁ СЗАДИ И С БОКОВ, ВЫДАЮТ ВПЕРЁД.",
+            "НА МАШИНЕ НАРИСОВАНО ТО, ЧТО ОНА ВЫПУСКАЕТ.",
+            "ИГРА СОХРАНЯЕТСЯ САМА.",
+            "",
+            "КОСНИСЬ ЭКРАНА, ЧТОБЫ НАЧАТЬ",
+        ];
         let lines = [
             "ALEMBIC - АЛХИМИЧЕСКИЙ ТАЙКУН",
             "",
@@ -3542,7 +3672,7 @@ let rate = format!("КРОЛИЧЬЯ НОРА: ВСЁ, ЧТО ВОШЛО В ПЕ
             "P / L          ПУТЬ КОНТРАКТА / СЛОЙ ПРОВОДОВ ЛОГИКИ",
             "C / T          КАТАЛОГ ПРЕДМЕТОВ / СТАТИСТИКА ПРОДАЖ",
             "G / V          ГИЛЬДИИ И ЗАКАЗЫ / ВИТРАЖ И НОВЫЙ ВИТОК",
-            "F2             СЕТЕВАЯ ИГРА ЧЕРЕЗ STEAM",
+            "F2             СЕТЕВАЯ ИГРА: STEAM ИЛИ ПО СЕТИ",
             "F3 / F11       СЧЁТЧИК FPS / ПОЛНЫЙ ЭКРАН",
             "Z              ПОДЗЕМЕЛЬЕ / ПОВЕРХНОСТЬ (СВЯЗЬ - ЛИФТЫ)",
             "WASD, КОЛЕСО   КАМЕРА, МАСШТАБ",
@@ -3556,6 +3686,7 @@ let rate = format!("КРОЛИЧЬЯ НОРА: ВСЁ, ЧТО ВОШЛО В ПЕ
             "",
             "ЩЁЛКНИ МЫШЬЮ, ЧТОБЫ НАЧАТЬ",
         ];
+        let lines: &[&str] = if self.touch.on { &touch_lines } else { &lines };
         c.fill_rect(0, 0, c.w, c.h, 0xA010_0E16);
         let bw = 700.min(c.w - 20);
         // Шаг строк ужимается, чтобы справка целиком влезала в невысокое окно.
@@ -3900,6 +4031,44 @@ mod tests {
         g.pasting = false;
         key(&mut g, Key::V, true);
         assert!(g.pasting && !g.show_great);
+    }
+
+    #[test]
+    fn gamepad_sides_and_menu() {
+        let mut g = game();
+        g.cam_x = 12.0;
+        g.cam_y = 12.0;
+        let kind = (0..80)
+            .map(|i| Kind(i as _))
+            .find(|k| {
+                let mut w = World::new(5);
+                w.money = 1e7;
+                w.level = FINAL_LEVEL;
+                w.place(*k, 12, 12, Dir::E).is_ok() && w.next_side(12, 12, 0).is_some()
+            })
+            .unwrap();
+        g.world.place(kind, 12, 12, Dir::E).unwrap();
+        let pad = |held: u32| Input { mx: -1, my: -1, pad: Pad { connected: true, held, ..Default::default() }, ..Default::default() };
+        let mut send = |g: &mut Game, held: u32| g.update(&pad(held), DT, 1280, 720);
+        send(&mut g, btn::R3);
+        send(&mut g, 0);
+        assert!(g.pad.active);
+        let (mx, my) = tile_px(&g, 12, 12);
+        g.pad.cur = (mx as f32, my as f32);
+        let (ports, dir) = (g.world.get(12, 12).unwrap().ports, g.dir);
+        send(&mut g, btn::X);
+        send(&mut g, btn::X | btn::UP);
+        send(&mut g, 0);
+        assert_ne!(g.world.get(12, 12).unwrap().ports, ports);
+        assert_eq!(g.dir, dir, "X как модификатор не поворачивает");
+        // START - меню, A - первый пункт (каталог).
+        send(&mut g, btn::START);
+        send(&mut g, 0);
+        send(&mut g, btn::A);
+        assert!(g.show_codex);
+        // Мышь забирает курсор обратно.
+        g.update(&Input { mx: 10, my: 10, dmx: 3, ..Default::default() }, DT, 1280, 720);
+        assert!(!g.pad.active);
     }
 
     #[test]

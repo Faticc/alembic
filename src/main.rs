@@ -19,7 +19,7 @@ mod world;
 use engine::audio::Audio;
 use engine::{Image, Input, Key};
 use game::{Game, SAVE_FILE};
-use minifb::{KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
+use minifb::{Key as MKey, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
 use world::{Dir, Kind, World};
 
 #[link(name = "user32")]
@@ -77,6 +77,98 @@ impl minifb::InputCallback for CharSink {
             buf.push(c);
         }
     }
+}
+
+/// Клавиша minifb -> клавиша игры (None - игре такая не нужна).
+/// Состояние первого подключённого геймпада (XInput, Windows.Gaming.Input и прочие через gilrs).
+fn read_pad(gilrs: &mut Option<gilrs::Gilrs>) -> engine::Pad {
+    use engine::btn;
+    use gilrs::{Axis, Button};
+    let Some(g) = gilrs.as_mut() else { return engine::Pad::default() };
+    while g.next_event().is_some() {}
+    let Some((_, gp)) = g.gamepads().find(|(_, gp)| gp.is_connected()) else { return engine::Pad::default() };
+    let mut held = 0;
+    for (b, bit) in [
+        (Button::South, btn::A),
+        (Button::East, btn::B),
+        (Button::West, btn::X),
+        (Button::North, btn::Y),
+        (Button::LeftTrigger, btn::LB),
+        (Button::RightTrigger, btn::RB),
+        (Button::Select, btn::BACK),
+        (Button::Start, btn::START),
+        (Button::LeftThumb, btn::L3),
+        (Button::RightThumb, btn::R3),
+        (Button::DPadUp, btn::UP),
+        (Button::DPadDown, btn::DOWN),
+        (Button::DPadLeft, btn::LEFT),
+        (Button::DPadRight, btn::RIGHT),
+    ] {
+        if gp.is_pressed(b) {
+            held |= bit;
+        }
+    }
+    let trig = |b: Button| gp.button_data(b).map_or(0.0, |d| d.value());
+    let (lt, rt) = (trig(Button::LeftTrigger2), trig(Button::RightTrigger2));
+    if lt > 0.5 {
+        held |= btn::LT;
+    }
+    if rt > 0.5 {
+        held |= btn::RT;
+    }
+    engine::Pad {
+        connected: true,
+        held,
+        lx: gp.value(Axis::LeftStickX),
+        ly: -gp.value(Axis::LeftStickY),
+        rx: gp.value(Axis::RightStickX),
+        ry: -gp.value(Axis::RightStickY),
+        lt,
+        rt,
+    }
+}
+
+fn map_key(k: MKey) -> Option<Key> {
+    Some(match k {
+        MKey::Key0 => Key::Key0,
+        MKey::Key1 => Key::Key1,
+        MKey::Key2 => Key::Key2,
+        MKey::Key3 => Key::Key3,
+        MKey::Key4 => Key::Key4,
+        MKey::Key5 => Key::Key5,
+        MKey::Key6 => Key::Key6,
+        MKey::Key7 => Key::Key7,
+        MKey::Key8 => Key::Key8,
+        MKey::Key9 => Key::Key9,
+        MKey::B => Key::B,
+        MKey::C => Key::C,
+        MKey::E => Key::E,
+        MKey::F => Key::F,
+        MKey::G => Key::G,
+        MKey::H => Key::H,
+        MKey::L => Key::L,
+        MKey::M => Key::M,
+        MKey::P => Key::P,
+        MKey::Q => Key::Q,
+        MKey::R => Key::R,
+        MKey::T => Key::T,
+        MKey::U => Key::U,
+        MKey::V => Key::V,
+        MKey::X => Key::X,
+        MKey::Z => Key::Z,
+        MKey::F1 => Key::F1,
+        MKey::F2 => Key::F2,
+        MKey::F3 => Key::F3,
+        MKey::F5 => Key::F5,
+        MKey::F11 => Key::F11,
+        MKey::Escape => Key::Escape,
+        MKey::Enter => Key::Enter,
+        MKey::NumPadEnter => Key::NumPadEnter,
+        MKey::Backspace => Key::Backspace,
+        MKey::Delete => Key::Delete,
+        MKey::Tab => Key::Tab,
+        _ => return None,
+    })
 }
 
 const TITLE: &str = "Alembic - алхимический тайкун";
@@ -515,6 +607,7 @@ fn main() {
             inp.my = 240;
         }
         game.show_net = has("--netmenu");
+        game.touch.on = has("--touch");
         game.show_help = has("--helpscreen");
         game.fps = 60.0;
         game.frame_ms = 16.7;
@@ -658,6 +751,8 @@ fn main() {
     let world = loaded.unwrap_or_else(|| World::new_game(seed));
     let mut game = Game::new(world, Audio::new(!smoke), fresh);
     game.persist = !smoke;
+    // Сенсорные кнопки на ПК: для экранов с касанием и для запуска Windows-версии на телефоне.
+    game.touch.on = has("--touch");
     if !smoke {
         game.open_library(game::BP_FILE);
     }
@@ -679,6 +774,8 @@ fn main() {
     let mut last = std::time::Instant::now();
     let (mut pl, mut pr) = (false, false);
     let (mut px1, mut px2) = (false, false);
+    // Геймпад необязателен: без драйверов игра просто работает без него.
+    let mut gilrs = gilrs::Gilrs::new().ok();
     let (mut pmx, mut pmy) = (0, 0);
     let mut frames = 0u32;
 
@@ -713,7 +810,7 @@ fn main() {
         let active = window.is_active();
         let x1 = active && unsafe { GetAsyncKeyState(5) } < 0;
         let x2 = active && unsafe { GetAsyncKeyState(6) } < 0;
-        let down = |a: Key, b: Key| window.is_key_down(a) || window.is_key_down(b);
+        let down = |a: MKey, b: MKey| window.is_key_down(a) || window.is_key_down(b);
         let axis = |neg: bool, pos: bool| (pos as i32 - neg as i32) as f32;
         let inp = Input {
             mx,
@@ -727,14 +824,15 @@ fn main() {
             rmb_pressed: rmb && !pr,
             x1_pressed: x1 && !px1,
             x2_pressed: x2 && !px2,
-            shift: down(Key::LeftShift, Key::RightShift),
-            ctrl: down(Key::LeftCtrl, Key::RightCtrl),
-            alt: down(Key::LeftAlt, Key::RightAlt),
+            shift: down(MKey::LeftShift, MKey::RightShift),
+            ctrl: down(MKey::LeftCtrl, MKey::RightCtrl),
+            alt: down(MKey::LeftAlt, MKey::RightAlt),
             wheel: window.get_scroll_wheel().map_or(0.0, |s| s.1),
-            pressed: window.get_keys_pressed(KeyRepeat::No),
+            pressed: window.get_keys_pressed(KeyRepeat::No).into_iter().filter_map(map_key).collect(),
             typed: TYPED.lock().map(|mut b| std::mem::take(&mut *b)).unwrap_or_default(),
-            pan_x: axis(down(Key::A, Key::Left), down(Key::D, Key::Right)),
-            pan_y: axis(down(Key::W, Key::Up), down(Key::S, Key::Down)),
+            pan_x: axis(down(MKey::A, MKey::Left), down(MKey::D, MKey::Right)),
+            pan_y: axis(down(MKey::W, MKey::Up), down(MKey::S, MKey::Down)),
+            pad: read_pad(&mut gilrs),
         };
         pl = lmb;
         pr = rmb;
